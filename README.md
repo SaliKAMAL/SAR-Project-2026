@@ -4,7 +4,7 @@
 
 - Luiz Eduardo Akazawa - GitHub : LuizAkazawa - Mail : luiz-eduardo.akazawa-nora@etu.univ-grenoble-alpes.fr
 - Soufian El Ouazzani - GitHub : soufian-elouazzani - Mail : soufian.elouazzani@etu.univ-grenoble-alpes.fr
-- Chaimae BOUTI - GitHub : Chaymae888 - Mail : 
+- Chaimae BOUTI - GitHub : Chaymae888 - Mail : Chaimae.Bouti@etu.univ-grenoble-alpes.fr
 - Salma KAMAL - GitHub: SaliKAMAL, GitLab : Salma-KAMAL - Mail : salma.kamal@etu.univ-grenoble-alpes.fr
 
 ### Point de contact du groupe : Salma KAMAL
