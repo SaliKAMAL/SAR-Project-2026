@@ -9,3 +9,12 @@
 
 ### Point de contact du groupe : Salma KAMAL
 ### Branche du rendu final : Main
+
+### Documents
+
+- Spécification : `docs/SAR_Multicast_Project_Specification.pdf`
+- Design du runtime des tâches : `docs/Design.md`
+
+### Projet Eclipse
+
+Importer le dossier `Salma_KAMAL` avec **File → Import → Existing Projects into Workspace**. Aucun réglage supplémentaire. Le projet s'appelle `SalmaKAMAL`.
