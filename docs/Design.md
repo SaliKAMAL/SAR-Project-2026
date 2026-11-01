@@ -70,3 +70,29 @@ java -cp bin edu.polytech.queues.tests.TestLogicalClock
 ```
 
 The successful run prints `logical clock tests: PASS`.
+
+## Part 2: Failures and shrinking group
+
+This stage introduces fail-stop actor crashes without resurrection. Surviving actors must maintain the totally-ordered multicast sequence and avoid deadlocks without relying on timeouts.
+
+### 1. Perfect Failure Detector
+The system implements a perfect failure detector relying directly on the underlying task runtime rather than network timeouts. 
+A task terminates either explicitly via `kill()` or stochastically when `mayFail()` is true and a random failure is drawn. In both cases, the runtime deterministicly closes the queues and triggers the registered `Task.Listener`. 
+This listener acts as the perfect detector: a member is announced dead only after its task is actually dead, and every death is immediately announced. Upon detection, it broadcasts a crash notice to all surviving actors.
+
+### 2. Flush Mechanism
+To maintain uniform agreement when a member disappears, survivors execute a synchronous flush phase before removing the crashed actor from their view:
+* **Broadcast pending set:** Upon receiving a crash notice, a survivor does not immediately delete the member. Instead, it sends the others the set of all not-yet-delivered messages it currently holds from the crashed sender, bundled with its current logical clock.
+* **Intersection rule:** Each survivor waits to receive this pending set from every other survivor. A survivor keeps a message from the crashed sender *if and only if* every survivor listed it in their set. 
+* **Resolution:** The retained messages are delivered strictly in timestamp order. Any other message from the crashed sender is permanently dropped. 
+* **View update:** Once resolved, the crashed ID formally leaves the view. The standard delivery stability rule resumes without waiting for acknowledgements from the dead actor.
+
+### 3. Isolation and Verification
+* Messages posted toward a dead member are naturally dropped, as the task runtime automatically closes that member’s queues upon `kill()`. Internal routing tasks remain non-failable.
+* Once the flush is complete and the actor is isolated, the state change is signaled to the external monitor via a direct, synchronous call to `Verifier.crashed(actorId)`.
+
+### 4. Tests
+Validation is handled by `TestMulticastFailures`, which introduces two distinct crash scenarios:
+1. **Forced Suicide:** An actor explicitly calls `kill()`.
+2. **Random Failures:** An actor is configured with `setMayFail(true)` and a `Task.setFailureProbability` greater than 0.
+Both scenarios are executed with a standard message period and then strictly repeated with `period = 0`. The verifier checks that all surviving actors reach the exact same delivery sequence. A timeout is configured to fail the test if any survivor deadlocks while waiting for a dead actor's acknowledgement. The test concludes successfully when remaining actors stabilize on the sequence and the dead actor delivers nothing further.
