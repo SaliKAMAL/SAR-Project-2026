@@ -77,7 +77,28 @@ The successful run prints `multicast no failure tests: PASS`.
 
 ## Salma KAMAL
 
-Failures, and the group only shrinks.
+### Failures, and the group only shrinks
+
+This stage extends the protocol to tolerate fail-stop crashes while maintaining Uniform Agreement. The group only shrinks; resurrection is not permitted (`generationId` remains `1`).
+
+**Perfect Failure Detector**
+The system implements a Class $\mathcal{P}$ (Perfect) failure detector without relying on network timeouts. It hooks directly into the deterministic task runtime. A `Task.Listener` is registered on every actor's task. When a task terminates—either explicitly via `kill()` or stochastically when `mayFail` is true—the runtime invokes `failed`. This listener instantly acts as the detector and broadcasts a `CrashNotice` to all surviving actors, ensuring strong completeness and strong accuracy.
+
+**The Flush and Intersection Protocol**
+To prevent deadlocks and ensure that all correct actors deliver the exact same sequence of messages from a crashed sender, a survivor does not immediately remove the crashed member from its local view. Instead, it executes a synchronous flush phase:
+1. **Pending Set Broadcast:** Upon receiving a `CrashNotice` for $p_k$, a survivor $p_i$ halts normal delivery of $p_k$'s messages. It broadcasts a `Flush` message containing its current logical clock and the exact set of not-yet-delivered messages it holds from $p_k$.
+2. **Absolute Intersection:** $p_i$ waits until it has received a `Flush` message from every other survivor in the current view. It then computes the mathematical intersection of all received sets. A message from $p_k$ is retained *if and only if* every survivor listed it.
+3. **Delivery and Purge:** Retained messages from $p_k$ are delivered strictly in timestamp order. Any message from $p_k$ not present in the absolute intersection is permanently dropped.
+
+**View Reconfiguration and Isolation**
+Once the flush is resolved, the crashed ID is officially removed from the `Group` view. The primary stability rule resumes seamlessly without waiting for acknowledgements from the dead actor. Messages posted toward the dead member are naturally dropped at the transport level, as the task runtime explicitly closes a member's message queues upon `kill()`. 
+Upon removing the actor from the view, the survivor synchronously calls `Verifier.crashed(actorId)`.
+
+**Validation (TestMulticastFailures)**
+The protocol is validated under two strict scenarios:
+1. **Forced Suicide:** An actor explicitly invokes `kill()`.
+2. **Stochastic Faults:** An actor is initialized with `setMayFail(true)` and a `failureProbability > 0` (internal tasks remain non-failable).
+Both scenarios are executed with a standard message period and then strictly repeated in burst mode (`period = 0`). The test passes when the dead actor ceases delivery, the `Verifier` confirms all surviving actors reached the exact same delivery sequence, and the test terminates without triggering the deadlock timeout.
 
 ## Chaimae BOUTI
 
