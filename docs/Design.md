@@ -1,29 +1,23 @@
-# Task runtime
+# Design
 
-## 1. Purpose
-
-The multicast is built on the course message platform (`QueueBroker`, `MessageQueue`, tasks, and circular buffers). Every task runs in the same Java runtime. This design extends that platform with a Lamport logical clock on each task and with fail-stop termination.
-
-The behaviour specified here is implemented by `edu.polytech.queues.Task`, `edu.polytech.queues.TaskKilled`, `edu.polytech.utils.CTask`, and `edu.polytech.utils.Executor`.
-
-## 2. Project layout
-
-The Eclipse project is the directory `Salma_KAMAL`. Its name is `SalmaKAMAL`. Import it with **File → Import → Existing Projects into Workspace**. The project carries its compiler settings and needs no extra library.
+The Eclipse project is the directory `Salma_KAMAL`. Its name is `SalmaKAMAL`. Import it with **File → Import → Existing Projects into Workspace**. The project carries its compiler settings and needs no extra library. Compiler compliance is Java 17. The output directory is `bin`.
 
 | Source folder | Role |
 |---|---|
-| `api` | `Task`, `QueueBroker`, `MessageQueue` |
+| `api` | Public types, including `edu.polytech.multicast` |
 | `local` | Local queues and brokers |
 | `utils.queues` | `CTask`, `Executor`, `CircularBuffer` |
-| `tests` | `TestLogicalClock` |
+| `tests` | `TestLogicalClock`, `TestMulticastNoFailure` |
 
-The compiler compliance is Java 17. The output directory is `bin`.
+## Soufian El Ouazzani
 
-## 3. Logical clock
+### Task runtime
 
-Each task holds one clock, a non-negative integer, initially `0`.
+The multicast is built on the course message platform (`QueueBroker`, `MessageQueue`, tasks, and circular buffers). Every task runs in the same Java runtime. This part extends that platform with a Lamport logical clock on each task and with fail-stop termination.
 
-The clock ticks once when a runnable posted on that task begins execution, before the body of the runnable runs. The value observed inside the runnable is therefore the value after the tick. A runnable that is never started does not tick the clock.
+The behaviour is implemented by `edu.polytech.queues.Task`, `edu.polytech.queues.TaskKilled`, `edu.polytech.utils.CTask`, and `edu.polytech.utils.Executor`.
+
+Each task holds one clock, a non-negative integer, initially `0`. The clock ticks once when a runnable posted on that task begins execution, before the body of the runnable runs. The value observed inside the runnable is therefore the value after the tick. A runnable that is never started does not tick the clock.
 
 `witness(timestamp)` records a timestamp observed from outside the task:
 
@@ -31,21 +25,13 @@ The clock ticks once when a runnable posted on that task begins execution, befor
 clock = max(clock, timestamp)
 ```
 
-A negative or smaller timestamp leaves the clock unchanged. The next runnable then ticks from that value, so local events stay strictly increasing.
+A smaller timestamp leaves the clock unchanged. `logicalClock()` returns the current value and does not tick.
 
-`logicalClock()` returns the current value. It does not tick.
+A task is either alive or dead. `dead()` is true after `kill()`, `fail`, or `exit`. `kill()` marks the task dead and discards every runnable still waiting on it, including delayed runnables. The same destruction applies to every task created from it by `newTask`. A `post` issued after the task is dead is ignored. The runnable that already started is not aborted in the middle of its body.
 
-## 4. Fail-stop
-
-A task is either alive or dead. `dead()` is true after `kill()`, `fail`, or `exit`.
-
-`kill()` is the explicit failure. It marks the task dead and discards every runnable still waiting on it, including delayed runnables. Those runnables never execute. The same destruction applies to every task created from it by `newTask`. A `post` issued after the task is dead is ignored. The runnable that already started is not aborted in the middle of its body.
-
-Random failure uses the same destruction. Each task has a boolean `mayFail`, false by default. Before a runnable starts, the runtime draws a failure only if `mayFail` is true. The probability is set by `setFailureProbability` and belongs to the closed interval `[0, 1]`. A probability of `0` never kills a task. A probability of `1` kills a failable task instead of starting its next runnable, and that runnable does not tick the clock. A task with `mayFail` false is never selected.
+Random failure uses the same destruction. Each task has a boolean `mayFail`, false by default. Before a runnable starts, the runtime draws a failure only if `mayFail` is true. The probability is set by `setFailureProbability` and belongs to the closed interval `[0, 1]`. A probability of `0` never kills a task. A probability of `1` kills a failable task instead of starting its next runnable, and that runnable does not tick the clock.
 
 On death, every message queue registered on the task is closed. If a listener was registered with `set`, it is notified through `failed`. A `TaskKilled` cause is the crash signal produced by `kill()` and by a random failure.
-
-## 5. Operations
 
 | Operation | Effect |
 |---|---|
@@ -58,11 +44,7 @@ On death, every message queue registered on the task is closed. If a listener wa
 | `post(Runnable)` | Ignored when the task is dead |
 | `Task.task()` | The task whose runnable is executing |
 
-## 6. Test
-
-`edu.polytech.queues.tests.TestLogicalClock` checks the clock, `witness`, `kill` (including tasks created from the killed task), and a random failure that strikes only a failable task.
-
-From the directory `Salma_KAMAL`:
+`edu.polytech.queues.tests.TestLogicalClock` checks the clock, `witness`, `kill`, and a random failure that strikes only a failable task. From `Salma_KAMAL`:
 
 ```bash
 javac -d bin $(find api local utils.queues tests -name '*.java')
@@ -71,28 +53,36 @@ java -cp bin edu.polytech.queues.tests.TestLogicalClock
 
 The successful run prints `logical clock tests: PASS`.
 
-## Part 2: Failures and shrinking group
+### Totally-ordered multicast without failures
 
-This stage introduces fail-stop actor crashes without resurrection. Surviving actors must maintain the totally-ordered multicast sequence and avoid deadlocks without relying on timeouts.
+Every actor stays alive. There is no crash, no join, no leave, and no reinsertion. `generationId` is always `1`.
 
-### 1. Perfect Failure Detector
-The system implements a perfect failure detector relying directly on the underlying task runtime rather than network timeouts. 
-A task terminates either explicitly via `kill()` or stochastically when `mayFail()` is true and a random failure is drawn. In both cases, the runtime deterministicly closes the queues and triggers the registered `Task.Listener`. 
-This listener acts as the perfect detector: a member is announced dead only after its task is actually dead, and every death is immediately announced. Upon detection, it broadcasts a crash notice to all surviving actors.
+`GroupManager.start(n, period)` creates `n` actors, gives each one private task, and connects every pair with a `MessageQueue`. It hands them the verifier and is not used after that. `period` is the delay between multicasts, and `0` is burst mode. Each actor then sends `GroupManager.MESSAGES_PER_ACTOR` messages.
 
-### 2. Flush Mechanism
-To maintain uniform agreement when a member disappears, survivors execute a synchronous flush phase before removing the crashed actor from their view:
-* **Broadcast pending set:** Upon receiving a crash notice, a survivor does not immediately delete the member. Instead, it sends the others the set of all not-yet-delivered messages it currently holds from the crashed sender, bundled with its current logical clock.
-* **Intersection rule:** Each survivor waits to receive this pending set from every other survivor. A survivor keeps a message from the crashed sender *if and only if* every survivor listed it in their set. 
-* **Resolution:** The retained messages are delivered strictly in timestamp order. Any other message from the crashed sender is permanently dropped. 
-* **View update:** Once resolved, the crashed ID formally leaves the view. The standard delivery stability rule resumes without waiting for acknowledgements from the dead actor.
+An actor sends and receives only through its queues. The runnable that sends has already ticked, so the message is stamped with `logicalClock()`. On reception the actor calls `witness` before storing the message. The sender also keeps its own message and delivers it through the same rule as every other member.
 
-### 3. Isolation and Verification
-* Messages posted toward a dead member are naturally dropped, as the task runtime automatically closes that member’s queues upon `kill()`. Internal routing tasks remain non-failable.
-* Once the flush is complete and the actor is isolated, the state change is signaled to the external monitor via a direct, synchronous call to `Verifier.crashed(actorId)`.
+A message carries `messageId`, `senderId`, `generationId`, `lamportTimestamp`, and `payload`. The order is the timestamp, smallest first. Equal timestamps are broken by `senderId`, with the same string order on every actor.
 
-### 4. Tests
-Validation is handled by `TestMulticastFailures`, which introduces two distinct crash scenarios:
-1. **Forced Suicide:** An actor explicitly calls `kill()`.
-2. **Random Failures:** An actor is configured with `setMayFail(true)` and a `Task.setFailureProbability` greater than 0.
-Both scenarios are executed with a standard message period and then strictly repeated with `period = 0`. The verifier checks that all surviving actors reach the exact same delivery sequence. A timeout is configured to fail the test if any survivor deadlocks while waiting for a dead actor's acknowledgement. The test concludes successfully when remaining actors stabilize on the sequence and the dead actor delivers nothing further.
+The head message is delivered only when every member of the view has sent a message or an acknowledgement whose timestamp is at least that high. Acknowledgements are not delivered to the application. `Group` holds the sorted member ids and does not remove anyone in this part.
+
+`Verifier` is a plain object, not an actor. On delivery the actor calls `delivered(actorId, messageId, payload)` directly. `check()` fails when two actors differ in the ids, the order, or the payload. `GroupListener` declares `joined`, `left`, `crashed`, `resurrected`, and `reinserted`. This part does not call it.
+
+`edu.polytech.multicast.tests.TestMulticastNoFailure` runs three actors with period `200`, then three actors with period `0`. From `Salma_KAMAL`:
+
+```bash
+java -cp bin edu.polytech.multicast.tests.TestMulticastNoFailure
+```
+
+The successful run prints `multicast no failure tests: PASS`.
+
+## Salma KAMAL
+
+Failures, and the group only shrinks.
+
+## Chaimae BOUTI
+
+Resurrection and reinsertion.
+
+## Luiz Eduardo Akazawa
+
+Voluntary join and leave.
