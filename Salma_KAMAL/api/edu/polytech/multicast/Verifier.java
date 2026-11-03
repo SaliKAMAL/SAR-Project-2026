@@ -24,6 +24,16 @@ public final class Verifier {
     notifyAll();
   }
 
+  private final java.util.Set<String> crashedActors = new java.util.HashSet<String>();
+
+  public synchronized void crashed(String actorId) {
+    crashedActors.add(actorId);
+  }
+
+  public synchronized java.util.Set<String> getCrashedActors() {
+    return crashedActors;
+  }
+  
   public synchronized boolean awaitComplete(int actorCount, int messagesPerActor, long timeoutMs)
       throws InterruptedException {
     int expected = actorCount * messagesPerActor;
@@ -62,6 +72,36 @@ public final class Verifier {
     }
   }
 
+  public synchronized void checkSurvivors(List<String> survivorIds) {
+	if (byActor.isEmpty())
+	  throw new AssertionError("no delivery was recorded");
+	      
+	List<Delivery> reference = null;
+    String referenceActor = null;
+	    
+    for (String actorId : survivorIds) {
+      List<Delivery> deliveries = byActor.get(actorId);
+      if (deliveries == null) continue;
+
+      if (reference == null) {
+        reference = deliveries;
+        referenceActor = actorId;
+        continue;
+      }
+	      
+      if (deliveries.size() != reference.size())
+        throw new AssertionError(actorId + " delivered " + deliveries.size()
+            + " messages, " + referenceActor + " delivered " + reference.size());
+	      
+      for (int i = 0; i < reference.size(); i++) {
+        Delivery expected = reference.get(i);
+        Delivery actual = deliveries.get(i);
+        if (expected.messageId != actual.messageId || !java.util.Arrays.equals(expected.payload, actual.payload))
+          throw new AssertionError("delivery " + i + " differs between " + referenceActor + " and " + actorId);
+      }
+    }
+  }
+  
   private boolean complete(int actorCount, int expected) {
     if (byActor.size() < actorCount)
       return false;

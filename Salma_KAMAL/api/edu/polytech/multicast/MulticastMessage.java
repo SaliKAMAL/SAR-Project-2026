@@ -16,6 +16,9 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
   static final byte DATA = 1;
   static final byte ACK = 2;
 
+  static final byte CRASH = 3;
+  static final byte FLUSH = 4;
+
   private final long messageId;
   private final String senderId;
   private final long generationId;
@@ -90,6 +93,39 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
       throw new IllegalStateException(ex);
     }
   }
+  
+  static byte[] encodeCrash(String crashedId, long lamportTimestamp) {
+	    try {
+	      ByteArrayOutputStream raw = new ByteArrayOutputStream();
+	      DataOutputStream out = new DataOutputStream(raw);
+	      out.writeByte(CRASH);
+	      out.writeUTF(crashedId);
+	      out.writeLong(lamportTimestamp);
+	      out.flush();
+	      return raw.toByteArray();
+	    } catch (IOException ex) {
+	      throw new IllegalStateException(ex);
+	    }
+	  }
+  
+  static byte[] encodeFlush(String senderId, String crashedId, long lamportTimestamp, long[] pendingIds) {
+	    try {
+	      ByteArrayOutputStream raw = new ByteArrayOutputStream();
+	      DataOutputStream out = new DataOutputStream(raw);
+	      out.writeByte(FLUSH);
+	      out.writeUTF(senderId);
+	      out.writeUTF(crashedId);
+	      out.writeLong(lamportTimestamp);
+	      out.writeInt(pendingIds.length);
+	      for (long id : pendingIds) {
+	        out.writeLong(id);
+	      }
+	      out.flush();
+	      return raw.toByteArray();
+	    } catch (IOException ex) {
+	      throw new IllegalStateException(ex);
+	    }
+	  }
 
   static Object decode(byte[] bytes) {
     try {
@@ -107,9 +143,23 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
       }
       if (kind == ACK)
         return new Ack(in.readUTF(), in.readLong());
+      if (kind == CRASH) {
+          return new CrashNotice(in.readUTF(), in.readLong());
+        }
+        if (kind == FLUSH) {
+          String senderId = in.readUTF();
+          String crashedId = in.readUTF();
+          long lamportTimestamp = in.readLong();
+          int length = in.readInt();
+          long[] pendingIds = new long[length];
+          for (int i = 0; i < length; i++) {
+            pendingIds[i] = in.readLong();
+          }
+          return new Flush(senderId, crashedId, lamportTimestamp, pendingIds);
+        }
       throw new IllegalArgumentException("unknown message kind " + kind);
     } catch (IOException ex) {
-      throw new IllegalArgumentException(ex);
+    	throw new IllegalArgumentException(ex);
     }
   }
 
@@ -122,6 +172,32 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
       this.lamportTimestamp = lamportTimestamp;
     }
   }
+  
+  public static final class CrashNotice {
+	public final String crashedId;
+    public final long lamportTimestamp;
+
+    public CrashNotice(String crashedId, long lamportTimestamp) {
+      this.crashedId = crashedId;
+      this.lamportTimestamp = lamportTimestamp;
+    }
+  }
+
+  public static final class Flush {
+	public final String senderId;
+	public final String crashedId;
+    public final long lamportTimestamp;
+    public final long[] pendingMessageIds; // Les IDs des messages non délivrés du mort
+
+	public Flush(String senderId, String crashedId, long lamportTimestamp, long[] pendingMessageIds) {
+	  this.senderId = senderId;
+      this.crashedId = crashedId;
+      this.lamportTimestamp = lamportTimestamp;
+      this.pendingMessageIds = pendingMessageIds;
+    }
+  }
+  
+  
 
   @Override
   public boolean equals(Object obj) {
