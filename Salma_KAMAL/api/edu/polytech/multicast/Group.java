@@ -5,20 +5,27 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * The fixed set of member ids, sorted so every actor sees the same order.
- * This part never removes a member.
+ * The set of member ids, sorted so every actor sees the same order.
+ * In Part 2, this group shrinks when a member is confirmed dead after a flush.
  */
 public final class Group {
-
   private final List<String> members;
 
   Group(List<String> memberIds) {
     List<String> sorted = new ArrayList<String>(memberIds);
     Collections.sort(sorted);
-    this.members = Collections.unmodifiableList(sorted);
+    // CRUCIAL : La liste doit être mutable pour la Partie 2 !
+    this.members = sorted;
   }
 
   public List<String> members() {
     return members;
+  }
+
+  /**
+   * Removes a crashed actor from the current view.
+   */
+  public void remove(String actorId) {
+    members.remove(actorId);
   }
 }
