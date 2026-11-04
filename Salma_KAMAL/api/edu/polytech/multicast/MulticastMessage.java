@@ -18,6 +18,9 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 
   static final byte CRASH = 3;
   static final byte FLUSH = 4;
+  
+  static final byte REINSERT_REQUEST = 5;
+  static final byte VIEW_FLUSH = 6;
 
   private final long messageId;
   private final String senderId;
@@ -162,6 +165,41 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
     	throw new IllegalArgumentException(ex);
     }
   }
+  
+  static final class ReinsertRequest {
+	    final String requesterId;
+	    final long generationId;
+	    final long lamportTimestamp;
+
+	    ReinsertRequest(String requesterId, long generationId, long lamportTimestamp) {
+	      this.requesterId = requesterId;
+	      this.generationId = generationId;
+	      this.lamportTimestamp = lamportTimestamp;
+	    }
+	  }
+
+	  static final class ViewFlush {
+	    final String senderId;
+	    final String subjectId;
+	    final long subjectGeneration;
+	    final long lamportTimestamp;
+
+	    ViewFlush(String senderId, String subjectId, long subjectGeneration, long lamportTimestamp) {
+	      this.senderId = senderId;
+	      this.subjectId = subjectId;
+	      this.subjectGeneration = subjectGeneration;
+	      this.lamportTimestamp = lamportTimestamp;
+	    }
+	  }
+	  
+	  static byte[] encodeReinsertRequest(String requesterId, long generationId, long lamportTimestamp) {
+		    throw new UnsupportedOperationException("Chaimae: encodeReinsertRequest");
+		  }
+	  
+	 
+	  static byte[] encodeViewFlush(String senderId, String subjectId, long subjectGeneration, long lamportTimestamp) {
+		    throw new UnsupportedOperationException("Chaimae: encodeViewFlush");
+		  }
 
   static final class Ack {
     final String senderId;
