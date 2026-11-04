@@ -23,10 +23,16 @@ public final class GroupManager {
 
   private GroupManager() {
   }
-
+  
   public static Started start(int n, int period) throws InterruptedException {
+	  return start(n, period, MESSAGES_PER_ACTOR);
+	}
+
+  public static Started start(int n, int period, int messagesPerActor) throws InterruptedException {
     if (n < 1)
       throw new IllegalArgumentException("n");
+    if (messagesPerActor < 1)
+        throw new IllegalArgumentException("messagesPerActor");
     if (period < 0)
       throw new IllegalArgumentException("period");
     String prefix = "g" + RUNS.incrementAndGet() + "-";
@@ -39,7 +45,7 @@ public final class GroupManager {
     Actor[] actors = new Actor[n];
     for (int i = 0; i < n; i++) {
       Task task = boot.newTask(null, ids.get(i));
-      actors[i] = new Actor(ids.get(i), i, task, group, verifier, actors, period, MESSAGES_PER_ACTOR);
+      actors[i] = new Actor(ids.get(i), i, task, group, verifier, actors, period, messagesPerActor);
     }
  // PART 2 (Salma): The Perfect Failure Detector with Synchronous Registration
     final Actor[] finalActors = actors;

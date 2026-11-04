@@ -34,6 +34,19 @@ public final class Verifier {
     return crashedActors;
   }
   
+  public synchronized void resurrected(String actorId) {
+	  throw new UnsupportedOperationException("Chaimae: Verifier.resurrected");
+	}
+	public synchronized void reinserted(String actorId) {
+	  throw new UnsupportedOperationException("Chaimae : Verifier.reinserted");
+	}
+	public synchronized boolean awaitReinserted(String actorId, long timeoutMs) throws InterruptedException {
+	  throw new UnsupportedOperationException("Chaimae : Verifier.awaitReinserted");
+	}
+	public synchronized void checkReinserted(List<String> survivorIds, String reinsertedId) {
+	  throw new UnsupportedOperationException("Chaimae : Verifier.checkReinserted");
+	}
+  
   public synchronized boolean awaitComplete(int actorCount, int messagesPerActor, long timeoutMs)
       throws InterruptedException {
     int expected = actorCount * messagesPerActor;

@@ -22,7 +22,7 @@ public final class Actor {
 
   private final String id;
   private final int index;
-  private final Task task;
+  private volatile Task task;
   private final Group group;
   private final Verifier verifier;
   private final Actor[] members;
@@ -38,6 +38,10 @@ public final class Actor {
   //Part 2 state for flush mechanism
   private final Set<String> flushingDeadActors = new HashSet<String>();
   private final Map<String, Map<String, Set<Long>>> flushSets = new HashMap<String, Map<String, Set<Long>>>();
+  
+  public enum State { IN_VIEW,DEAD,RESPAWNED}
+  private volatile State state = State.IN_VIEW;
+  private volatile long generationId=1L;
 
   Actor(String id, int index, Task task, Group group, Verifier verifier, Actor[] members, int period,
       int messagesToSend) {
@@ -58,10 +62,26 @@ public final class Actor {
   public Task task() {
     return task;
   }
+  
+  public State state() {
+	  return state;
+  }
+  
+  public long generationId() {
+	  return generationId;
+  }
 
   void openBroker() {
     broker = task.newBroker(id);
   }
+  
+  public void respawn() {
+	  throw new UnsupportedOperationException("Chaimae : respawn() is not implemented yet");
+  }
+  
+  public void reinsert() {
+	  throw new UnsupportedOperationException("Chaimae : reinsert() is not implemented yet");
+	}
 
   void bindToHigherPeers() {
     for (int other = index + 1; other < members.length; other++) {
