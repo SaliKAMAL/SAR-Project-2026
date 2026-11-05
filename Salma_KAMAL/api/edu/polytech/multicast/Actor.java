@@ -43,6 +43,12 @@ public final class Actor {
   private volatile State state = State.IN_VIEW;
   private volatile long generationId=1L;
   
+  /**
+   * Generation accepted for each member of the view. A message or an acknowledgement is ignored
+   * if its sender is not in this map or if its generation is not the accepted one.
+   */
+  private final Map<String, Long> acceptedGeneration = new HashMap<String, Long>();
+  
   private static final long MANUAL_ID_BIT = 1L << 31;
   private int manualSent;
 
@@ -52,6 +58,8 @@ public final class Actor {
     this.index = index;
     this.task = task;
     this.group = new Group(group.members());
+    for (String member : group.members())
+        acceptedGeneration.put(member, Long.valueOf(1L));
     this.verifier = verifier;
     this.members = members;
     this.period = period;
@@ -64,6 +72,24 @@ public final class Actor {
 
   public Task task() {
     return task;
+  }
+  
+  static long messageId(long generation, int index, long sequence) {
+	    return (generation << 48) | (((long) index) << 32) | sequence;
+	  }
+  
+  /** True if the sender is in the view and the generation is the one we accept for it. */
+  private boolean accepts(String senderId, long generation) {
+    Long accepted = acceptedGeneration.get(senderId);
+    return accepted != null && accepted.longValue() == generation;
+  }
+
+  /** Sends to the members of the view only. The others (dead, outside the view) get nothing. */
+  private void broadcast(byte[] wire) {
+    for (Map.Entry<String, MessageQueue> peer : peers.entrySet()) {
+      if (group.members().contains(peer.getKey()))
+        peer.getValue().send(wire, 0, wire.length, null);
+    }
   }
   
   public void multicast(final byte[] payload) {
@@ -180,9 +206,7 @@ public final class Actor {
       }
 
       byte[] wire = MulticastMessage.encodeFlush(id, crashedId, timestamp, pendingIds);
-      for (MessageQueue peer : peers.values()) {
-        peer.send(wire, 0, wire.length, null);
-      }
+      broadcast(wire);
 	      
       processFlushSet(id, crashedId, pendingIds);
 	      
@@ -263,6 +287,7 @@ public final class Actor {
 
     // 4. Shrink the group and notify the Verifier
     group.remove(crashedId);
+    acceptedGeneration.remove(crashedId);
     verifier.crashed(crashedId);
 
     // 5. With the dead actor gone from the view, the stability rule will now pass. Try to deliver!
@@ -295,8 +320,7 @@ public final class Actor {
     observe(id, timestamp);
     pending.add(message);
     byte[] wire = MulticastMessage.encodeData(message);
-    for (MessageQueue peer : peers.values())
-      peer.send(wire, 0, wire.length, null);
+    broadcast(wire);
     sent++;
     tryDeliver();
     if (sent >= messagesToSend)
@@ -324,17 +348,18 @@ public final class Actor {
 	    observe(id, timestamp);
 	    pending.add(message);
 	    byte[] wire = MulticastMessage.encodeData(message);
-	    for (MessageQueue peer : peers.values())
-	      peer.send(wire, 0, wire.length, null);
+	    broadcast(wire);
 	    tryDeliver();
 	  }
 
-  private void onReceive(byte[] bytes) {
+   void onReceive(byte[] bytes) {
 	    try {
 	      Object incoming = MulticastMessage.decode(bytes);
 	      
 	      if (incoming instanceof MulticastMessage.Ack) {
 	        MulticastMessage.Ack ack = (MulticastMessage.Ack) incoming;
+	        if (!accepts(ack.senderId, ack.generationId))
+	            return;
 	        observe(ack.senderId, ack.lamportTimestamp);
 	        tryDeliver();
 	        return;
@@ -349,8 +374,8 @@ public final class Actor {
 	      }
 	      
 	      MulticastMessage message = (MulticastMessage) incoming;
-	      if (message.generationId() != 1L)
-	        return;
+	      if (!accepts(message.senderId(), message.generationId()))
+	          return;
 	      observe(message.senderId(), message.lamportTimestamp());
 	      if (deliveredIds.contains(message.messageId()))
 	        return;
@@ -367,9 +392,8 @@ public final class Actor {
   private void acknowledge() {
     long timestamp = task.logicalClock();
     observe(id, timestamp);
-    byte[] wire = MulticastMessage.encodeAck(id, timestamp);
-    for (MessageQueue peer : peers.values())
-      peer.send(wire, 0, wire.length, null);
+    byte[] wire = MulticastMessage.encodeAck(id, generationId, timestamp);
+    broadcast(wire);
   }
 
   private void observe(String senderId, long timestamp) {

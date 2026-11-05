@@ -83,12 +83,13 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
     }
   }
 
-  static byte[] encodeAck(String senderId, long lamportTimestamp) {
+  static byte[] encodeAck(String senderId, long generationId, long lamportTimestamp) {
     try {
       ByteArrayOutputStream raw = new ByteArrayOutputStream();
       DataOutputStream out = new DataOutputStream(raw);
       out.writeByte(ACK);
       out.writeUTF(senderId);
+      out.writeLong(generationId);
       out.writeLong(lamportTimestamp);
       out.flush();
       return raw.toByteArray();
@@ -145,7 +146,7 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
         return new MulticastMessage(messageId, senderId, generationId, lamportTimestamp, payload);
       }
       if (kind == ACK)
-        return new Ack(in.readUTF(), in.readLong());
+        return new Ack(in.readUTF(), in.readLong(), in.readLong());
       if (kind == CRASH) {
           return new CrashNotice(in.readUTF(), in.readLong());
         }
@@ -203,12 +204,14 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 
   static final class Ack {
     final String senderId;
+    final long generationId;
     final long lamportTimestamp;
 
-    Ack(String senderId, long lamportTimestamp) {
-      this.senderId = senderId;
-      this.lamportTimestamp = lamportTimestamp;
-    }
+    Ack(String senderId, long generationId, long lamportTimestamp) {
+        this.senderId = senderId;
+        this.generationId = generationId;
+        this.lamportTimestamp = lamportTimestamp;
+      }
   }
   
   public static final class CrashNotice {
