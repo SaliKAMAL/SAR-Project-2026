@@ -188,6 +188,82 @@ At `resurrected`, it records the ids already delivered by the other actors (the 
 
 `TestMulticastReinsertion` covers: suicide and random failure, with a long period and with period `0`; two reinsertions in a row; a respawned actor left outside the view; reinsertion under heavy load; respawn before the crash flush has ended; calls in the wrong state.
 
-## Luiz Eduardo Akazawa
+## Luiz Eduardo AKAZAWA NORA
 
-Voluntary join and leave.
+### Voluntary join and leave
+
+A new actor can join the running group, and a member can leave without crashing. Failures and reinsertion still work as in the previous stages. The message fields, ordering by `(timestamp, senderId)`, and normal acknowledgement rule stay the same.
+
+A join or leave completes pending deliveries from the old view before installing the next view.
+
+#### Membership requests
+
+The new operations are `join(peerId)` for an actor in `CREATED`, and `leave()` for an actor in `IN_VIEW`. They run on the actor's private task. Invalid calls are rejected. Retries keep the same request id.
+
+```
+CREATED → JOINING → IN_VIEW → LEAVING → LEFT
+```
+
+A `JOINING` actor only exchanges the messages needed to join the group. A `LEAVING` actor stops sending new multicast messages but keeps receiving messages, sending acknowledgements, and delivering messages until its leave finishes. `LEFT` is terminal: new actors use new ids. A crashed actor uses Stage 3's `respawn()` and `reinsert()` instead.
+
+`GroupManager` is only used at startup. A newcomer contacts an existing member through `QueueBroker`. That peer forwards the request. It cannot admit the newcomer alone.
+
+Join, leave, and reinsertion requests use the multicast protocol so all members process them in the same order. Members perform one membership change at a time. These requests are handled internally instead of being delivered as multicast messages. Later requests wait and are checked against the actor’s state and the updated membership before being processed.
+
+Each membership change increases viewId. Members keep the actor IDs and their generations, as in Stage 3. Each join or leave request identifies the current view, the request, the operation, and the actor with its generation. Replies from cancelled or earlier changes are ignored. Message IDs remain unique when new actors join.
+
+#### Completing pending messages before a membership change
+
+Join and graceful leave use the following flush. Reinsertion follows Stage 3. Join, leave, and reinsertion requests are processed one at a time.
+
+1. Pause sending and delivering multicast messages. Keep receiving messages and sending acknowledgements. New multicast requests wait locally. The task never blocks its thread.
+2. Each old member sends a marker marking the end of its multicast sends for the current view. It uses the same MessageQueue connection, after its earlier messages have been accepted. These queues preserve sending order. Receiving a marker from every other member confirms that all earlier multicast messages have arrived.
+3. Exchange pending messages and clocks. Keep the union of pending messages, including those from a graceful leaver. Keep delivered ids too, to avoid duplicates.
+4. Each current member, including the leaving actor, delivers the remaining messages from the current view in (timestamp, senderId) order, skipping messages it has already delivered. All members confirm that they have completed these deliveries before proceeding.
+5. Collect clocks after finishing these deliveries. Let `V` be their maximum, also including the newcomer's clock when joining. All participants call `witness(V)`.
+6. Record and confirm the membership decision using the steps below. Record the join or leave with the verifier and notify listeners before releasing waiting sends or enabling deliveries in the new view. Sends and initial acknowledgements run in new runnables, giving them timestamps greater than `V`.
+
+Queues continue receiving messages during the change. Messages sent under the new membership wait until the receiving actor has updated its member list. Markers, acknowledgements, and membership requests are handled internally.
+
+#### Confirming a join or leave
+
+The participants are all current members, including a leaver, plus the newcomer for a join. They exchange the following messages through their queues. Each message identifies the request, original view, and proposed next view. Replies for the active exchange remain valid after local installation. Replies count once per actor and generation. Each participant counts its own reply locally.
+
+1. Each participant sends `READY` to everyone after finishing its preparation. It includes the proposed member list and `V`. All replies must agree on these values.
+2. A participant that has matching `READY` replies from everyone records a `DECISION` and sends it to all participants. The decision contains the next view id, member list, `V`, and the complete set of ready replies. Every participant computes the same decision for the selected request.
+3. A participant accepts a decision only with the complete matching ready replies. It keeps the decision and sends `STORED` to everyone. Receiving the same decision again only repeats the acknowledgement.
+4. After receiving `STORED` from every participant for that decision, an actor updates its membership, records the event with the verifier, and notifies its listener. It then sends `INSTALLED` and enables sends and deliveries allowed by its state. A leaver stops multicast sends and deliveries but continues processing membership replies until it receives `INSTALLED` from all remaining members and closes its queues. The next membership request waits until everyone has confirmed installation or crash recovery has resolved the change.
+
+Members retain the decision for the current view and through any recovery for that change. If a participant crashes, they pause the change and exchange `CHANGE_STATUS` messages containing any recorded decision. The exchange identifies the request, original view, and surviving participants. Status messages for a different survivor set are ignored. A participant sends its status only after pausing. It stops creating decisions for that attempt, and late replies cannot advance it normally. An already recorded decision is included even if local membership has not changed yet.
+
+Wait for status messages from every surviving participant. If any contains a valid decision, everyone keeps that decision and waits for storage confirmations from every surviving participant before completing the membership change. Membership notifications are recorded before any new deliveries. Multicast sends and deliveries remain paused until recovery and any required Stage 2 crash procedure finish. If none contains one, cancel the attempt. Then use Stage 2 for any actor that is a member after this outcome, and retry requests that remain valid. If another participant crashes during recovery, repeat the status exchange with the remaining survivors. Messages from earlier exchanges cannot complete the new exchange.
+
+These steps apply to voluntary joins and leaves. Reinsertion still follows Stage 3. Each membership event is recorded once by the verifier, even when several members report it. Each local listener is notified once before deliveries in the new view. The verifier compares message ids, order, and payload for periods when actors shared membership, without requiring newcomers to receive earlier history.
+
+#### Joining and leaving
+
+For **`join(peerId)`**:
+
+1. Create the actor's task, broker, empty pending queue, and acknowledgement table. Its generation starts at `1`. Register its id and connection details through the contacted peer, which submits the join request.
+2. While `JOINING`, connect queues with every old member and wait for the request's turn. The old members run the flush among themselves, without sending their history to the newcomer.
+3. Prepare the next view with the newcomer. It calls `witness(V)` and confirms that its queues are ready. Complete the decision exchange before updating membership. On local installation, set the newcomer to `IN_VIEW` and record the join before enabling multicast sends and deliveries.
+4. In a new runnable, the newcomer sends an acknowledgement with a timestamp greater than `V` to everyone. The join notification uses `Verifier.joined(actorId)` and `GroupListener.joined`.
+
+The newcomer ignores messages timestamped at or below `V`. From admission onwards, it follows the same delivery rule as the others.
+
+For **`leave()`**:
+
+1. Set the actor to `LEAVING`, stop its periodic sender, and submit the leave request. Messages already sent still belong to the old view.
+2. Run the flush with every old member, including the leaver. Keep its pending messages and finish the same old deliveries everywhere.
+3. Complete the decision exchange, then remove its id, generation, and acknowledgement entry from the next view. Remaining members call `witness(V)` and stop waiting for its acknowledgements.
+4. On local installation, set the leaver to `LEFT` and stop its message deliveries. The leave notification uses `Verifier.left(actorId)` and `GroupListener.left`. Close its queues only after receiving `INSTALLED` from every remaining member.
+
+The leaver keeps its delivered history but gets no later messages. Multicast messages and normal acknowledgements from actors outside the installed view are ignored. Replies from the original participants are still accepted for an unfinished membership exchange. If the last member leaves, it finishes its pending messages and leaves an empty, terminal group. Another group needs a new bootstrap.
+
+#### Crashes during membership changes
+
+Stage 2 handles actor crashes. If a crash interrupts a join or leave, survivors first resolve the membership decision using the procedure described above.
+
+1. If no decision was retained, cancel the interrupted change. A crashed newcomer has not joined, and a crashed leaver remains a failed member.
+2. If a decision was retained, complete the membership change, then apply Stage 2’s crash procedure if the crashed actor belongs to the resulting group.
+3. If the peer introducing a newcomer crashes, the newcomer retries through another member using the same request ID. Pending membership requests are checked against the updated membership before being retried.
