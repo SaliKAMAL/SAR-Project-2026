@@ -42,6 +42,9 @@ public final class Actor {
   public enum State { IN_VIEW,DEAD,RESPAWNED}
   private volatile State state = State.IN_VIEW;
   private volatile long generationId=1L;
+  
+  private static final long MANUAL_ID_BIT = 1L << 31;
+  private int manualSent;
 
   Actor(String id, int index, Task task, Group group, Verifier verifier, Actor[] members, int period,
       int messagesToSend) {
@@ -303,6 +306,18 @@ public final class Actor {
         }
       }, period);
   }
+  
+  private void sendManual(byte[] payload) {
+	    long timestamp = task.logicalClock();
+	    long messageId = (((long) index) << 32) | MANUAL_ID_BIT | (++manualSent);
+	    MulticastMessage message = new MulticastMessage(messageId, id, 1L, timestamp, payload);
+	    observe(id, timestamp);
+	    pending.add(message);
+	    byte[] wire = MulticastMessage.encodeData(message);
+	    for (MessageQueue peer : peers.values())
+	      peer.send(wire, 0, wire.length, null);
+	    tryDeliver();
+	  }
 
   private void onReceive(byte[] bytes) {
 	    try {
