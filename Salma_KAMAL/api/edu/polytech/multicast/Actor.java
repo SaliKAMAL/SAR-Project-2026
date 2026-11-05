@@ -66,6 +66,16 @@ public final class Actor {
     return task;
   }
   
+  public void multicast(final byte[] payload) {
+	    final byte[] copy = payload.clone();
+	    task.post(new Runnable() {
+	      @Override
+	      public void run() {
+	        sendManual(copy);
+	      }
+	    });
+	  }
+  
   public State state() {
 	  return state;
   }
