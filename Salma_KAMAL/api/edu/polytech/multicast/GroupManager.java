@@ -50,37 +50,22 @@ public final class GroupManager {
  // PART 2 (Salma): The Perfect Failure Detector with Synchronous Registration
     final Actor[] finalActors = actors;
     Task detectorTask = boot.newTask(null, "detector");
+    for (int i = 0; i < actors.length; i++)
+        actors[i].setDetector(detectorTask); // Part 3: needed to watch the task of a respawned actor
     final java.util.concurrent.CountDownLatch detectorReady = new java.util.concurrent.CountDownLatch(1);
     
-    detectorTask.post(new Runnable() {
-      @Override
-      public void run() {
-        for (int i = 0; i < finalActors.length; i++) {
-          final Actor actor = finalActors[i];
-          actor.task().set(new Task.Listener() {
-            @Override
-            public void failed(Task t, Throwable th) {
-              System.out.println(">>> DETECTOR: " + actor.id() + " has crashed! Notifying peers...");
-              for (int j = 0; j < finalActors.length; j++) {
-                final Actor peer = finalActors[j];
-                if (!peer.id().equals(actor.id()) && !peer.task().dead()) {
-                  peer.task().post(new Runnable() {
-                    @Override
-                    public void run() {
-                      peer.onCrashNotice(actor.id());
-                    }
-                  });
-                }
-              }
-            }
-            @Override
-            public void completed(Task t, Object o) {}
-          });
-        }
-        detectorReady.countDown(); // Signale que tous les listeners sont branchés
-      }
-    });
+    
 
+    detectorTask.post(new Runnable() {
+        @Override
+        public void run() {
+          for (int i = 0; i < finalActors.length; i++) {
+            final Actor actor = finalActors[i];
+            actor.task().set(crashListener(actor, finalActors));
+          }
+          detectorReady.countDown(); // Signale que tous les listeners sont branchés
+        }
+      });
     try {
       detectorReady.await(); // On fige le démarrage du monde tant que le détecteur n'est pas prêt !
     } catch (InterruptedException e) {
@@ -96,6 +81,7 @@ public final class GroupManager {
       @Override
       public void run(Actor actor) {
         actor.bindToHigherPeers();
+        actor.bindRejoinPorts();
       }
     }));
     final CountDownLatch linked = new CountDownLatch(n);
@@ -124,6 +110,35 @@ public final class GroupManager {
     List<Actor> members = new ArrayList<Actor>();
     Collections.addAll(members, actors);
     return new Started(group, verifier, Collections.unmodifiableList(members));
+  }
+  
+  /**
+   * The perfect failure detector for one actor. It runs on the detector task when the task of that
+   * actor dies. Part 3: it also marks the actor DEAD, and it is set again on the task of a respawned actor.
+   */
+  static Task.Listener crashListener(final Actor actor, final Actor[] all) {
+    return new Task.Listener() {
+      @Override
+      public void failed(Task t, Throwable th) {
+        actor.markDead();
+        System.out.println(">>> DETECTOR: " + actor.id() + " has crashed! Notifying peers...");
+        for (int j = 0; j < all.length; j++) {
+          final Actor peer = all[j];
+          if (!peer.id().equals(actor.id()) && !peer.task().dead()) {
+            peer.task().post(new Runnable() {
+              @Override
+              public void run() {
+                peer.onCrashNotice(actor.id());
+              }
+            });
+          }
+        }
+      }
+
+      @Override
+      public void completed(Task t, Object o) {
+      }
+    };
   }
 
   private static CountDownLatch postEach(Actor[] actors, final Job job) {

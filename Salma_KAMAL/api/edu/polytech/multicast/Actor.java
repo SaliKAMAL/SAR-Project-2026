@@ -1,7 +1,7 @@
 package edu.polytech.multicast;
 
 import java.util.HashMap;
-
+import edu.polytech.queues.local.Boot;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.PriorityQueue;
@@ -43,6 +43,16 @@ public final class Actor {
   private volatile State state = State.IN_VIEW;
   private volatile long generationId=1L;
   
+  /** A respawned actor connects to port REJOIN_PORT_BASE + its index on the broker of each member. */
+  static final int REJOIN_PORT_BASE = 1000;
+  /** Queues opened by a respawned actor. They join 'peers' only when the actor is in the view. */
+  private final Map<String, MessageQueue> rejoinQueues = new HashMap<String, MessageQueue>();
+  private volatile String brokerName;
+  private Task detectorTask;
+  private boolean respawning;
+  private boolean respawnFailable;
+  private int linksToWait;
+  
   /**
    * Generation accepted for each member of the view. A message or an acknowledgement is ignored
    * if its sender is not in this map or if its generation is not the accepted one.
@@ -58,6 +68,7 @@ public final class Actor {
     this.index = index;
     this.task = task;
     this.group = new Group(group.members());
+    this.brokerName = id;
     for (String member : group.members())
         acceptedGeneration.put(member, Long.valueOf(1L));
     this.verifier = verifier;
@@ -114,13 +125,49 @@ public final class Actor {
     broker = task.newBroker(id);
   }
   
+  /**
+   * Part 3, step 1: resurrection. Allowed only when state() == DEAD, otherwise IllegalStateException.
+   * Creates a new task (watched by the failure detector), a new broker and new queues to the members,
+   * empties the message queue and the acknowledgement table, increments generationId, calls
+   * Verifier.resurrected(id). The actor stays outside the view (RESPAWNED).
+   * It returns at once: wait for state() == RESPAWNED.
+   */
   public void respawn() {
-	  throw new UnsupportedOperationException("Chaimae : respawn() is not implemented yet");
+    synchronized (this) {
+      if (state != State.DEAD || respawning)
+        throw new IllegalStateException(id + " is " + state + ": respawn() needs a dead actor");
+      if (detectorTask == null)
+        throw new IllegalStateException(id + " has no failure detector");
+      respawning = true;
+    }
+    final long newGeneration = generationId + 1;
+    final boolean failable = task.mayFail();
+    final Task fresh = new Boot().newTask(null, id + "@" + newGeneration);
+    final Actor self = this;
+    detectorTask.post(new Runnable() {
+      @Override
+      public void run() {
+        fresh.set(GroupManager.crashListener(self, members)); // the detector watches the new task
+      }
+    });
+    fresh.post(new Runnable() {
+      @Override
+      public void run() {
+        startNewLife(fresh, newGeneration, failable);
+      }
+    });
   }
-  
+
+  /**
+   * Part 3, step 2: reinsertion. Allowed only when state() == RESPAWNED, otherwise IllegalStateException.
+   * View change ordered with the messages by a flush. Then the actor is IN_VIEW and
+   * delivers only messages whose timestamp is greater than the view timestamp.
+   */
   public void reinsert() {
-	  throw new UnsupportedOperationException("Chaimae : reinsert() is not implemented yet");
-	}
+    if (state != State.RESPAWNED)
+      throw new IllegalStateException(id + " is " + state + ": reinsert() needs a respawned actor");
+    throw new UnsupportedOperationException("Chaimae: reinsert() is not implemented yet");
+  }
 
   void bindToHigherPeers() {
     for (int other = index + 1; other < members.length; other++) {
@@ -159,6 +206,111 @@ public final class Actor {
         throw new IllegalStateException(id + " could not reach " + peerId);
     }
   }
+  
+  void setDetector(Task detectorTask) {
+	    this.detectorTask = detectorTask;
+	  }
+
+	  /** Called by the failure detector when the task of this actor is dead. */
+	  void markDead() {
+	    state = State.DEAD;
+	  }
+
+	  String brokerName() {
+	    return brokerName;
+	  }
+
+	  /** Every actor accepts, for each other actor, the connection of a respawned actor. */
+	  void bindRejoinPorts() {
+	    for (int other = 0; other < members.length; other++) {
+	      if (other == index)
+	        continue;
+	      final String peerId = members[other].id;
+	      boolean bound = broker.bind(REJOIN_PORT_BASE + other, new BindListener() {
+	        @Override
+	        public void accepted(MessageQueue queue) {
+	          rejoinQueues.put(peerId, queue);
+	          queue.setListener(listener());
+	        }
+
+	        @Override
+	        public void unbound() {
+	        }
+	      });
+	      if (!bound)
+	        throw new IllegalStateException(id + " could not bind rejoin port for " + peerId);
+	    }
+	  }
+
+	  /** Runs on the new task. The actor comes back empty and outside the view. */
+	  private void startNewLife(Task fresh, long newGeneration, boolean failable) {
+	    task = fresh;
+	    generationId = newGeneration;
+	    brokerName = id + "@" + newGeneration;
+	    respawnFailable = failable;
+	    pending.clear();
+	    lastSeen.clear();
+	    deliveredIds.clear();
+	    acceptedGeneration.clear(); // nobody is accepted until the actor is in a view
+	    flushingDeadActors.clear();
+	    flushSets.clear();
+	    peers.clear();
+	    rejoinQueues.clear();
+	    sent = messagesToSend; // the new life does not replay the periodic load
+	    manualSent = 0;
+	    broker = task.newBroker(brokerName); // a broker name can not be used twice
+	    bindRejoinPorts();
+	    linksToWait = 0;
+	    for (Actor other : members) {
+	      if (other == this || other.state() != State.IN_VIEW)
+	        continue;
+	      linksToWait++;
+	      connectToMember(other);
+	    }
+	    if (linksToWait == 0)
+	      finishRespawn();
+	  }
+
+	  private void connectToMember(final Actor other) {
+	    boolean started = broker.connect(other.brokerName(), REJOIN_PORT_BASE + index, new ConnectListener() {
+	      @Override
+	      public void connected(MessageQueue queue) {
+	        peers.put(other.id, queue);
+	        queue.setListener(listener());
+	        if (--linksToWait == 0)
+	          finishRespawn();
+	      }
+
+	      @Override
+	      public void refused() {
+	        throw new IllegalStateException(id + " was refused by " + other.id);
+	      }
+	    });
+	    if (!started)
+	      throw new IllegalStateException(id + " could not reach " + other.id);
+	  }
+
+	  private void finishRespawn() {
+	    task.setMayFail(respawnFailable); // failable again only now, so setup can not be killed at random
+	    verifier.resurrected(id);
+	    synchronized (this) {
+	      respawning = false;
+	      state = State.RESPAWNED;
+	    }
+	  }
+	  
+	  private MessageQueue.Listener listener() {
+		    return new MessageQueue.Listener() {
+		      @Override
+		      public void received(byte[] message) {
+		        onReceive(message);
+		      }
+
+		      @Override
+		      public void closed() {
+		      }
+		    };
+		  }
 
   void whenLinked(Runnable callback) {
     this.onLinked = callback;
@@ -181,6 +333,8 @@ public final class Actor {
    * It starts the flush phase by broadcasting its pending messages from the crashed sender.
    */
   void onCrashNotice(String crashedId) {
+	  if (state != State.IN_VIEW)
+		  return; // outside the view: not part of the flush
     try {
       if (!group.members().contains(crashedId) || flushingDeadActors.contains(crashedId)) {
         return;
@@ -296,16 +450,7 @@ public final class Actor {
   
   private void link(String peerId, MessageQueue queue) {
     peers.put(peerId, queue);
-    queue.setListener(new MessageQueue.Listener() {
-      @Override
-      public void received(byte[] message) {
-        onReceive(message);
-      }
-
-      @Override
-      public void closed() {
-      }
-    });
+    queue.setListener(listener());
     if (peers.size() == members.length - 1 && onLinked != null)
       onLinked.run();
   }
@@ -342,6 +487,8 @@ public final class Actor {
   }
   
   private void sendManual(byte[] payload) {
+	  if (state != State.IN_VIEW)
+		  return; // a respawned actor does not multicast before it is reinserted
 	    long timestamp = task.logicalClock();
 	    long messageId = (((long) index) << 32) | MANUAL_ID_BIT | (++manualSent);
 	    MulticastMessage message = new MulticastMessage(messageId, id, 1L, timestamp, payload);
