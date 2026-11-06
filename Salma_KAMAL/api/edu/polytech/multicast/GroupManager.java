@@ -41,6 +41,45 @@ public final class GroupManager {
       Task task = boot.newTask(null, ids.get(i));
       actors[i] = new Actor(ids.get(i), i, task, group, verifier, actors, period, MESSAGES_PER_ACTOR);
     }
+ // PART 2 (Salma): The Perfect Failure Detector with Synchronous Registration
+    final Actor[] finalActors = actors;
+    Task detectorTask = boot.newTask(null, "detector");
+    final java.util.concurrent.CountDownLatch detectorReady = new java.util.concurrent.CountDownLatch(1);
+    
+    detectorTask.post(new Runnable() {
+      @Override
+      public void run() {
+        for (int i = 0; i < finalActors.length; i++) {
+          final Actor actor = finalActors[i];
+          actor.task().set(new Task.Listener() {
+            @Override
+            public void failed(Task t, Throwable th) {
+              System.out.println(">>> DETECTOR: " + actor.id() + " has crashed! Notifying peers...");
+              for (int j = 0; j < finalActors.length; j++) {
+                final Actor peer = finalActors[j];
+                if (!peer.id().equals(actor.id()) && !peer.task().dead()) {
+                  peer.task().post(new Runnable() {
+                    @Override
+                    public void run() {
+                      peer.onCrashNotice(actor.id());
+                    }
+                  });
+                }
+              }
+            }
+            @Override
+            public void completed(Task t, Object o) {}
+          });
+        }
+        detectorReady.countDown(); // Signale que tous les listeners sont branchés
+      }
+    });
+
+    try {
+      detectorReady.await(); // On fige le démarrage du monde tant que le détecteur n'est pas prêt !
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
     await(postEach(actors, new Job() {
       @Override
       public void run(Actor actor) {
