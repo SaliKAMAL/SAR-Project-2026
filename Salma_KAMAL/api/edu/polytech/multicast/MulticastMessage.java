@@ -62,7 +62,12 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
     int byTime = Long.compare(lamportTimestamp, other.lamportTimestamp);
     if (byTime != 0)
       return byTime;
-    return senderId.compareTo(other.senderId);
+    int bySender = senderId.compareTo(other.senderId);
+    if (bySender != 0)
+      return bySender;
+    // Part 3: the order must be total. Equal timestamps from one sender are possible (messages that
+    // waited during a view change), and a PriorityQueue does not keep equal elements in order.
+    return Long.compare(messageId, other.messageId);
   }
 
   static byte[] encodeData(MulticastMessage message) {
@@ -161,7 +166,11 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
           }
           return new Flush(senderId, crashedId, lamportTimestamp, pendingIds);
         }
-      throw new IllegalArgumentException("unknown message kind " + kind);
+        if (kind == REINSERT_REQUEST)
+            return new ReinsertRequest(in.readUTF(), in.readLong(), in.readLong());
+        if (kind == VIEW_FLUSH)
+            return new ViewFlush(in.readUTF(), in.readLong(), in.readUTF(), in.readLong(), in.readLong());
+        throw new IllegalArgumentException("unknown message kind " + kind);
     } catch (IOException ex) {
     	throw new IllegalArgumentException(ex);
     }
@@ -181,12 +190,14 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 
 	  static final class ViewFlush {
 	    final String senderId;
+	    final long senderGeneration;
 	    final String subjectId;
 	    final long subjectGeneration;
 	    final long lamportTimestamp;
 
-	    ViewFlush(String senderId, String subjectId, long subjectGeneration, long lamportTimestamp) {
+	    ViewFlush(String senderId, long senderGeneration, String subjectId, long subjectGeneration,long lamportTimestamp) {
 	      this.senderId = senderId;
+	      this.senderGeneration = senderGeneration;
 	      this.subjectId = subjectId;
 	      this.subjectGeneration = subjectGeneration;
 	      this.lamportTimestamp = lamportTimestamp;
@@ -194,13 +205,42 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 	  }
 	  
 	  static byte[] encodeReinsertRequest(String requesterId, long generationId, long lamportTimestamp) {
-		    throw new UnsupportedOperationException("Chaimae: encodeReinsertRequest");
+		  try {
+		      ByteArrayOutputStream raw = new ByteArrayOutputStream();
+		      DataOutputStream out = new DataOutputStream(raw);
+		      out.writeByte(REINSERT_REQUEST);
+		      out.writeUTF(requesterId);
+		      out.writeLong(generationId);
+		      out.writeLong(lamportTimestamp);
+		      out.flush();
+		      return raw.toByteArray();
+		    } catch (IOException ex) {
+		      throw new IllegalStateException(ex);
+		    }
 		  }
 	  
 	 
-	  static byte[] encodeViewFlush(String senderId, String subjectId, long subjectGeneration, long lamportTimestamp) {
-		    throw new UnsupportedOperationException("Chaimae: encodeViewFlush");
-		  }
+	  /**
+	   * Part 3: answer to a view change. The queues are FIFO, so when a member has the answer of
+	   * another member, it also has every message that member sent before. It is a barrier.
+	   */
+	  static byte[] encodeViewFlush(String senderId, long senderGeneration, String subjectId,
+	      long subjectGeneration, long lamportTimestamp) {
+	    try {
+	      ByteArrayOutputStream raw = new ByteArrayOutputStream();
+	      DataOutputStream out = new DataOutputStream(raw);
+	      out.writeByte(VIEW_FLUSH);
+	      out.writeUTF(senderId);
+	      out.writeLong(senderGeneration);
+	      out.writeUTF(subjectId);
+	      out.writeLong(subjectGeneration);
+	      out.writeLong(lamportTimestamp);
+	      out.flush();
+	      return raw.toByteArray();
+	    } catch (IOException ex) {
+	      throw new IllegalStateException(ex);
+	    }
+	  }
 
   static final class Ack {
     final String senderId;
