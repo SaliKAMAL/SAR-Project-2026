@@ -14,6 +14,10 @@ import edu.polytech.queues.QueueBroker.BindListener;
 import edu.polytech.queues.QueueBroker.ConnectListener;
 import edu.polytech.queues.Task;
 
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.concurrent.CopyOnWriteArrayList;
+
 /**
  * One group member. It owns a single task and talks to the others only through
  * message queues. In this part the member never leaves and never crashes.
@@ -53,6 +57,28 @@ public final class Actor {
   private boolean respawnFailable;
   private int linksToWait;
   
+//---- Part 3: reinsertion = a view change, at most one at a time ----
+ /** What a view change is waiting for: the answer (ViewFlush) of every member and of the subject. */
+ private static final class ViewChange {
+   final String subjectId;
+   final long subjectGeneration;
+   final Set<String> expected = new HashSet<String>();
+   final Map<String, MulticastMessage.ViewFlush> replies = new HashMap<String, MulticastMessage.ViewFlush>();
+
+   ViewChange(String subjectId, long subjectGeneration) {
+     this.subjectId = subjectId;
+     this.subjectGeneration = subjectGeneration;
+   }
+ }
+
+ private ViewChange viewChange;
+ /** True from our answer to a view change until the new view is installed: we do not multicast. */
+ private boolean frozen;
+ private volatile boolean reinserting;
+ private final List<Object> deferredViewMessages = new ArrayList<Object>();
+ private final List<byte[]> deferredSends = new ArrayList<byte[]>();
+ private final List<GroupListener> listeners = new CopyOnWriteArrayList<GroupListener>();
+  
   /**
    * Generation accepted for each member of the view. A message or an acknowledgement is ignored
    * if its sender is not in this map or if its generation is not the accepted one.
@@ -89,10 +115,26 @@ public final class Actor {
 	    return (generation << 48) | (((long) index) << 32) | sequence;
 	  }
   
+  /** Part 3: listeners are told about resurrected and reinserted. */
+  public void addListener(GroupListener listener) {
+    listeners.add(listener);
+  }
+  
+  /** For tests, to be called on the task of this actor: is this payload waiting, not delivered yet? */
+  boolean holdsPayload(String payload) {
+    for (MulticastMessage message : pending)
+      if (new String(message.payload()).equals(payload))
+        return true;
+    return false;
+  }
+  
   /** True if the sender is in the view and the generation is the one we accept for it. */
   private boolean accepts(String senderId, long generation) {
-    Long accepted = acceptedGeneration.get(senderId);
-    return accepted != null && accepted.longValue() == generation;
+	  if (state == State.RESPAWNED) return peers.containsKey(senderId); // before its view is installed, it listens to the members
+      if (viewChange != null && senderId.equals(viewChange.subjectId) && generation == viewChange.subjectGeneration)
+        return true; // the actor that comes back may be faster than us to install the view
+      Long accepted = acceptedGeneration.get(senderId);
+      return accepted != null && accepted.longValue() == generation;
   }
 
   /** Sends to the members of the view only. The others (dead, outside the view) get nothing. */
@@ -164,9 +206,214 @@ public final class Actor {
    * delivers only messages whose timestamp is greater than the view timestamp.
    */
   public void reinsert() {
-    if (state != State.RESPAWNED)
-      throw new IllegalStateException(id + " is " + state + ": reinsert() needs a respawned actor");
-    throw new UnsupportedOperationException("Chaimae: reinsert() is not implemented yet");
+    synchronized (this) {
+      if (state != State.RESPAWNED || reinserting)
+        throw new IllegalStateException(id + " is " + state + ": reinsert() needs a respawned actor");
+      reinserting = true;
+    }
+    task.post(new Runnable() {
+      @Override
+      public void run() {
+        beginOwnReinsertion();
+      }
+    });
+  }
+
+  /**
+   * Runs on the task of the respawned actor. It asks every member to change the view and gives its
+   * own answer to the flush. It is installed in the view when it has the answer of every member.
+   */
+  private void beginOwnReinsertion() {
+    ViewChange change = new ViewChange(id, generationId);
+    change.expected.addAll(peers.keySet());
+    change.expected.add(id);
+    viewChange = change;
+    long timestamp = task.logicalClock();
+    byte[] request = MulticastMessage.encodeReinsertRequest(id, generationId, timestamp);
+    byte[] flush = MulticastMessage.encodeViewFlush(id, generationId, id, generationId, timestamp);
+    for (MessageQueue peer : peers.values()) {
+      peer.send(request, 0, request.length, null);
+      peer.send(flush, 0, flush.length, null);
+    }
+    change.replies.put(id, new MulticastMessage.ViewFlush(id, generationId, id, generationId, timestamp));
+    completeOwnReinsertionIfReady();
+  }
+
+  /** The respawned actor is back in the view. It never delivers a message with a timestamp <= V. */
+  private void completeOwnReinsertionIfReady() {
+    ViewChange change = viewChange;
+    if (change == null || !change.replies.keySet().containsAll(change.expected))
+      return;
+    long view = viewTimestamp(change);
+    task.witness(view);
+    for (Iterator<MulticastMessage> it = pending.iterator(); it.hasNext();)
+      if (it.next().lamportTimestamp() <= view)
+        it.remove();
+    group.reset(change.expected);
+    acceptedGeneration.clear();
+    for (MulticastMessage.ViewFlush reply : change.replies.values()) {
+      acceptedGeneration.put(reply.senderId, Long.valueOf(reply.senderGeneration));
+      raiseLastSeen(reply.senderId, view);
+    }
+    viewChange = null;
+    synchronized (this) {
+      reinserting = false;
+      state = State.IN_VIEW;
+    }
+    for (GroupListener listener : listeners)
+      listener.reinserted(id);
+    verifier.reinserted(id);
+    // from the next runnable on, our timestamps are greater than the view timestamp
+    task.post(new Runnable() {
+      @Override
+      public void run() {
+        if (state != State.IN_VIEW)
+          return;
+        acknowledge(); // tells the members we are there, so nobody waits for us
+        tryDeliver();
+      }
+    });
+  }
+
+  /** A member receives a reinsertion request or an answer to a view change. */
+  private void handleViewMessage(Object message) {
+    long timestamp = message instanceof MulticastMessage.ReinsertRequest
+        ? ((MulticastMessage.ReinsertRequest) message).lamportTimestamp
+        : ((MulticastMessage.ViewFlush) message).lamportTimestamp;
+    task.witness(timestamp);
+    if (state == State.RESPAWNED) { // we only wait for the answers to our own request
+      if (message instanceof MulticastMessage.ViewFlush && viewChange != null) {
+        MulticastMessage.ViewFlush reply = (MulticastMessage.ViewFlush) message;
+        viewChange.replies.put(reply.senderId, reply);
+        completeOwnReinsertionIfReady();
+      }
+      return;
+    }
+    if (state != State.IN_VIEW)
+      return;
+    String subject;
+    long subjectGeneration;
+    if (message instanceof MulticastMessage.ReinsertRequest) {
+      subject = ((MulticastMessage.ReinsertRequest) message).requesterId;
+      subjectGeneration = ((MulticastMessage.ReinsertRequest) message).generationId;
+    } else {
+      subject = ((MulticastMessage.ViewFlush) message).subjectId;
+      subjectGeneration = ((MulticastMessage.ViewFlush) message).subjectGeneration;
+    }
+    if (viewChange == null) {
+      if (group.members().contains(subject)) {
+        deferredViewMessages.add(message); // we have not finished the crash flush of this actor yet
+        return;
+      }
+      beginViewChange(subject, subjectGeneration);
+    } else if (!viewChange.subjectId.equals(subject) || viewChange.subjectGeneration != subjectGeneration) {
+      deferredViewMessages.add(message); // one view change at a time
+      return;
+    }
+    if (message instanceof MulticastMessage.ViewFlush) {
+      MulticastMessage.ViewFlush reply = (MulticastMessage.ViewFlush) message;
+      viewChange.replies.put(reply.senderId, reply);
+    }
+    completeViewChangeIfReady();
+  }
+
+  /** We stop multicasting and answer the flush to every member and to the actor that comes back. */
+  private void beginViewChange(String subject, long subjectGeneration) {
+    ViewChange change = new ViewChange(subject, subjectGeneration);
+    change.expected.addAll(group.members());
+    change.expected.add(subject);
+    viewChange = change;
+    frozen = true;
+    long timestamp = task.logicalClock();
+    observe(id, timestamp);
+    byte[] flush = MulticastMessage.encodeViewFlush(id, generationId, subject, subjectGeneration, timestamp);
+    broadcast(flush);
+    MessageQueue back = rejoinQueues.get(subject);
+    if (back != null)
+      back.send(flush, 0, flush.length, null);
+    change.replies.put(id, new MulticastMessage.ViewFlush(id, generationId, subject, subjectGeneration, timestamp));
+  }
+
+  /**
+   * With the answer of every member we hold every message sent before the view change (barrier).
+   * Those have a timestamp <= V: we deliver them, then install the view. Every message sent from now on
+   * has a timestamp > V.
+   */
+  private void completeViewChangeIfReady() {
+    ViewChange change = viewChange;
+    if (change == null || !change.replies.keySet().containsAll(change.expected))
+      return;
+    long view = viewTimestamp(change);
+    task.witness(view);
+    deliverUpTo(view);
+    group.add(change.subjectId);
+    acceptedGeneration.put(change.subjectId, Long.valueOf(change.subjectGeneration));
+    raiseLastSeen(change.subjectId, view);
+    MessageQueue back = rejoinQueues.remove(change.subjectId);
+    if (back != null)
+      peers.put(change.subjectId, back);
+    viewChange = null;
+    frozen = false;
+    tryDeliver();
+    // from the next runnable on, our timestamps are greater than the view timestamp
+    task.post(new Runnable() {
+      @Override
+      public void run() {
+        resumeAfterViewChange();
+      }
+    });
+  }
+
+  private void resumeAfterViewChange() {
+    if (state != State.IN_VIEW || frozen)
+      return;
+    // Tell everybody, the actor that came back included, how far we have seen. Without this, an ack
+    // sent before the view was installed never reached the new member, and it could wait forever.
+    acknowledge();
+    tryDeliver();
+    // One runnable per message: the clock ticks for each of them, so their timestamps differ.
+    List<byte[]> sends = new ArrayList<byte[]>(deferredSends);
+    deferredSends.clear();
+    for (final byte[] payload : sends) {
+      task.post(new Runnable() {
+        @Override
+        public void run() {
+          sendManual(payload);
+        }
+      });
+    }
+    redispatchDeferredViewMessages();
+  }
+
+  private void redispatchDeferredViewMessages() {
+    if (viewChange != null || deferredViewMessages.isEmpty())
+      return;
+    List<Object> messages = new ArrayList<Object>(deferredViewMessages);
+    deferredViewMessages.clear();
+    for (Object message : messages)
+      handleViewMessage(message);
+  }
+
+  private static long viewTimestamp(ViewChange change) {
+    long view = 0;
+    for (MulticastMessage.ViewFlush reply : change.replies.values())
+      view = Math.max(view, reply.lamportTimestamp);
+    return view;
+  }
+
+  private void raiseLastSeen(String memberId, long timestamp) {
+    Long previous = lastSeen.get(memberId);
+    if (previous == null || previous.longValue() < timestamp)
+      lastSeen.put(memberId, Long.valueOf(timestamp));
+  }
+
+  private void deliverUpTo(long limit) {
+    while (!pending.isEmpty() && pending.peek().lamportTimestamp() <= limit) {
+      MulticastMessage head = pending.poll();
+      if (!deliveredIds.add(Long.valueOf(head.messageId())))
+        continue;
+      verifier.delivered(id, head.messageId(), head.payload());
+    }
   }
 
   void bindToHigherPeers() {
@@ -256,6 +503,11 @@ public final class Actor {
 	    flushSets.clear();
 	    peers.clear();
 	    rejoinQueues.clear();
+	    viewChange = null;                
+	    frozen = false;                   
+	    reinserting = false;              
+	    deferredViewMessages.clear();     
+	    deferredSends.clear();
 	    sent = messagesToSend; // the new life does not replay the periodic load
 	    manualSent = 0;
 	    broker = task.newBroker(brokerName); // a broker name can not be used twice
@@ -293,6 +545,8 @@ public final class Actor {
 	  private void finishRespawn() {
 	    task.setMayFail(respawnFailable); // failable again only now, so setup can not be killed at random
 	    verifier.resurrected(id);
+	    for (GroupListener listener : listeners)  
+	        listener.resurrected(id);
 	    synchronized (this) {
 	      respawning = false;
 	      state = State.RESPAWNED;
@@ -442,10 +696,16 @@ public final class Actor {
     // 4. Shrink the group and notify the Verifier
     group.remove(crashedId);
     acceptedGeneration.remove(crashedId);
+    lastSeen.remove(crashedId);
     verifier.crashed(crashedId);
+    if (viewChange != null) { // a member died during a view change: we do not wait for its answer 
+        viewChange.expected.remove(crashedId);                                                         
+        completeViewChangeIfReady();                                                                   
+      }
 
     // 5. With the dead actor gone from the view, the stability rule will now pass. Try to deliver!
     tryDeliver();
+    redispatchDeferredViewMessages(); // a reinsertion request may have been waiting for this crash flush
   }
   
   private void link(String peerId, MessageQueue queue) {
@@ -458,10 +718,19 @@ public final class Actor {
   private void sendOne() {
     if (sent >= messagesToSend)
       return;
+    if (frozen) { // a view change is running: try again soon
+        task.post(new Runnable() {                             
+          @Override                                            
+          public void run() {                                  
+            sendOne();                                         
+          }                                                    
+        }, 5);                                                 
+        return;                                                
+      }
     long timestamp = task.logicalClock();
-    long messageId = (((long) index) << 32) | (sent + 1);
+    long messageId = messageId(generationId, index, sent + 1);
     byte[] payload = (id + "#" + sent).getBytes();
-    MulticastMessage message = new MulticastMessage(messageId, id, 1L, timestamp, payload);
+    MulticastMessage message = new MulticastMessage(messageId, id, generationId, timestamp, payload);
     observe(id, timestamp);
     pending.add(message);
     byte[] wire = MulticastMessage.encodeData(message);
@@ -489,9 +758,13 @@ public final class Actor {
   private void sendManual(byte[] payload) {
 	  if (state != State.IN_VIEW)
 		  return; // a respawned actor does not multicast before it is reinserted
+	  if (frozen) {                  
+		    deferredSends.add(payload);  
+		    return;                      
+		  }
 	    long timestamp = task.logicalClock();
-	    long messageId = (((long) index) << 32) | MANUAL_ID_BIT | (++manualSent);
-	    MulticastMessage message = new MulticastMessage(messageId, id, 1L, timestamp, payload);
+	    long messageId = messageId(generationId, index, MANUAL_ID_BIT | (++manualSent));
+	    MulticastMessage message = new MulticastMessage(messageId, id, generationId, timestamp, payload);
 	    observe(id, timestamp);
 	    pending.add(message);
 	    byte[] wire = MulticastMessage.encodeData(message);
@@ -511,6 +784,12 @@ public final class Actor {
 	        tryDeliver();
 	        return;
 	      }
+	      
+	   // Part 3: reinsertion                                                          
+          if (incoming instanceof MulticastMessage.ReinsertRequest || incoming instanceof MulticastMessage.ViewFlush) {
+            handleViewMessage(incoming);                                                  
+            return;                                                                       
+          }
 	      
 	      // Part 2: Intercept Flush messages
 	      if (incoming instanceof MulticastMessage.Flush) {
@@ -537,6 +816,8 @@ public final class Actor {
 	  }
 
   private void acknowledge() {
+	  if (state != State.IN_VIEW)
+		    return;
     long timestamp = task.logicalClock();
     observe(id, timestamp);
     byte[] wire = MulticastMessage.encodeAck(id, generationId, timestamp);
@@ -551,6 +832,8 @@ public final class Actor {
   }
 
   private void tryDeliver() {
+	  if (state != State.IN_VIEW || viewChange != null)
+		    return;
     while (!pending.isEmpty()) {
       MulticastMessage head = pending.peek();
       if (!stable(head))
