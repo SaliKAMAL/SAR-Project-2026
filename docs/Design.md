@@ -102,7 +102,91 @@ Both scenarios are executed with a standard message period and then strictly rep
 
 ## Chaimae BOUTI
 
-Resurrection and reinsertion.
+### Resurrection and reinsertion
+
+This stage adds one thing: a dead actor can come back. It comes back **empty**. The messages it missed while it was dead stay missed forever.
+
+What changes in the code:
+
+- The `messageId` now contains the generation: `generation << 48 | actor index << 32 | sequence`.
+- Acknowledgements also carry the `generationId`.
+- Two new message kinds: `REINSERT_REQUEST` and `VIEW_FLUSH`.
+- When two messages have the same timestamp and the same sender, the `messageId` decides the order.
+
+The stability rule is the same. The crash flush of Part 2 is not reused: a reinsertion removes nobody, so it needs a simpler flush (section 4).
+
+#### 1. Two steps, not one
+
+"Alive" and "in the group" are not the same thing.
+
+| Step | Method | Result |
+|---|---|---|
+| 1. Resurrection | `respawn()` | The actor is alive again, but **outside the view**. |
+| 2. Reinsertion | `reinsert()` | The actor is **inside the view** and takes part in the multicast. |
+
+```
+IN_VIEW  --crash-->  DEAD  --respawn()-->  RESPAWNED  --reinsert()-->  IN_VIEW
+```
+
+- `respawn()` works only if the actor is `DEAD`. `reinsert()` works only if it is `RESPAWNED`. In any other state they throw `IllegalStateException`.
+- `respawn()` does **not** wait for the crash flush of Part 2. If a survivor still has the actor in its view, it keeps the reinsertion request on hold until its crash flush is finished (section 6).
+- `respawn()` returns at once. The caller waits for `state() == RESPAWNED`.
+
+#### 2. Generation
+
+`generationId` starts at `1`. Each `respawn()` adds `1`. It tells apart the old life and the new life of the same actor id.
+
+- Every message and every acknowledgement carries the `generationId` of its sender.
+- Each actor keeps, for every member of its view, the generation it accepts. A message or acknowledgement with another generation is **ignored**: it is not stored and not counted for stability. This is how late messages of the old life are dropped.
+- The generation is also inside the `messageId`, so a message of the new life is never taken for a duplicate of the old life.
+- Two exceptions to "the accepted generation comes from the view":
+  - a `RESPAWNED` actor accepts the members it is connected to;
+  - a member that runs a view change for actor X accepts the new generation of X, because X can be in its new view before the members are.
+
+#### 3. Resurrection: `respawn()`
+
+1. Create a **new task** and a **new broker** named `id@generation` (a broker name cannot be used twice). The failure detector watches the new task. Random failure is switched on again only when the setup is finished.
+2. Connect to every member that is `IN_VIEW`. The connection uses a reserved "rejoin" port (1000 + actor index) that every actor opens at start. The members keep these new queues **apart** from their normal links, so nobody sends anything to the actor yet.
+3. **Empty** the message queue, the acknowledgement table and the list of delivered ids. The new life does not replay the periodic load.
+4. Increase `generationId` by 1.
+5. Call `Verifier.resurrected(actorId)` and `GroupListener.resurrected`.
+6. Set the state to `RESPAWNED`.
+
+After this the actor is **not in the view**. The members do not send it anything and do not wait for its acknowledgements. It does not multicast and does not deliver anything. This is why the gap stays empty.
+
+#### 4. Reinsertion: `reinsert()`
+
+Reinsertion is a **view change**. Nobody is removed, so no message is dropped and we do not need sets of messages. The FIFO queues do the ordering: when a member has the answer of another member, it already has every message that member sent before. The answer works like a barrier.
+
+1. **Request.** The respawned actor sends `REINSERT_REQUEST` (its id, its new generation, its clock) to every member. Then it sends its own `VIEW_FLUSH` answer.
+2. **Freeze.** A member that gets the first message of this view change stops multicasting. If the application asks for a multicast, the payload waits in a list. The member sends `VIEW_FLUSH` (its clock) to every member and to the returning actor. It delivers nothing during the view change.
+3. **Choose V.** A member is ready when it has the `VIEW_FLUSH` of every member and of the returning actor. `V` is the biggest clock among these answers. Every message sent before the view change has a timestamp `<= V`.
+4. **Install.** The member calls `witness(V)`, delivers in order everything it holds with a timestamp `<= V`, adds the actor to the view with its new generation, and unfreezes.
+5. **Announce.** In its next step, the member sends an acknowledgement to everybody, the returning actor included. (Without it, an acknowledgement sent before the install never reached the new member, and the new member could wait forever.) Then it sends the waiting payloads, one per step, so each has a different timestamp, greater than `V`.
+6. **The returning actor** does the same when it has all the answers: `witness(V)`, removes from its queue every message `<= V`, installs the view, calls `Verifier.reinserted` and `GroupListener.reinserted`, becomes `IN_VIEW`, and sends its announce acknowledgement.
+
+#### 5. What the reinserted actor delivers
+
+Only messages with a timestamp **greater than `V`**. It never receives a copy of the old history. A message `<= V` is removed from its queue when it installs the view. From then on it follows the normal stability rule, and its sequence is the end of the sequence of the other members.
+
+#### 6. Interaction with other events
+
+- **A member crashes during a view change.** We stop waiting for its answer and the view change goes on. It is not restarted.
+- **A reinsertion request arrives while the crash flush of that same actor is still running.** The request waits and is handled when the crash flush ends.
+- **Several view changes at once.** One at a time. The other messages wait and are replayed after the current one.
+- **The returning actor dies during its own reinsertion.** *Known limitation:* not fully handled yet (about 1 run in 60 gets stuck).
+
+#### 7. Verifier and tests
+
+The verifier gets two events: `resurrected(actorId)` and `reinserted(actorId)`.
+
+At `resurrected`, it records the ids already delivered by the other actors (the **absent list**) and where the new life starts. `checkReinserted` then verifies that the new life:
+
+- delivers nothing from the absent list;
+- delivers nothing twice;
+- is exactly the end of the sequence of the survivors.
+
+`TestMulticastReinsertion` covers: suicide and random failure, with a long period and with period `0`; two reinsertions in a row; a respawned actor left outside the view; reinsertion under heavy load; respawn before the crash flush has ended; calls in the wrong state.
 
 ## Luiz Eduardo Akazawa
 
