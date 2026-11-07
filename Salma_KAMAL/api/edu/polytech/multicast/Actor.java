@@ -159,7 +159,7 @@ public final class Actor {
     }
   }
 
-  /**
+/**
    * Part 2: Collect flush sets from survivors.
    */
   private void processFlushSet(String senderId, String crashedId, long[] pendingIds) {
@@ -167,34 +167,60 @@ public final class Actor {
       return; // Already resolved
     }
 
-    Map<String, Set<Long>> setsForDead = flushSets.get(crashedId);
+    java.util.Map<String, java.util.Set<Long>> setsForDead = flushSets.get(crashedId);
     if (setsForDead == null) {
       // If we receive a flush before our local detector fired, trigger it now
       onCrashNotice(crashedId);
       setsForDead = flushSets.get(crashedId);
-	      
-      // Ajout Salma (Part 2) : Protection si la résolution a été synchrone !
+        
+      // Added by Salma (Part 2): Ensure protection when the resolution is synchronous
       if (setsForDead == null) {
           return;
       }
     }
 
-    Set<Long> set = new HashSet<Long>();
+    java.util.Set<Long> set = new java.util.HashSet<Long>();
     for (long msgId : pendingIds) {
       set.add(msgId);
     }
     setsForDead.put(senderId, set);
 
-    // Check if we have received the flush set from ALL alive members (except the dead one)
-    List<String> currentMembers = group.members();
-    Set<String> expectedSurvivors = new HashSet<String>(currentMembers);
-    expectedSurvivors.remove(crashedId);
-
-    if (setsForDead.keySet().containsAll(expectedSurvivors)) {
-      executeIntersectionRule(crashedId, setsForDead, expectedSurvivors);
-    }
+    // Check all pending flush operations whenever a message is received.
+    tryResolveFlushes();
   }
   
+/**
+ * Tries to resolve all pending flush operations.
+ * When multiple actors crash, they are no longer expected to wait for one another.
+ */
+  private void tryResolveFlushes() {
+    boolean progress;
+    do {
+      progress = false;
+      // Copy the collection to avoid ConcurrentModificationException during resolution.
+      java.util.List<String> deadActors = new java.util.ArrayList<String>(flushingDeadActors);
+      
+      for (String deadId : deadActors) {
+        if (!group.members().contains(deadId)) {
+          continue; // Already resolved
+        }
+        
+        java.util.Map<String, java.util.Set<Long>> setsForDead = flushSets.get(deadId);
+        if (setsForDead == null) continue;
+
+        // The key idea: wait for the lists from all active members, excluding the ones that crashed.
+        java.util.Set<String> expectedSurvivors = new java.util.HashSet<String>(group.members());
+        expectedSurvivors.removeAll(flushingDeadActors);
+
+        if (setsForDead.keySet().containsAll(expectedSurvivors)) {
+          executeIntersectionRule(deadId, setsForDead, expectedSurvivors);
+          progress = true;
+          break; 
+        }
+      }
+    } while (progress);
+  }
+
   /**
    * Part 2: Absolute intersection and view shrinking.
    */
@@ -300,7 +326,7 @@ public final class Actor {
 	        MulticastMessage.Flush flush = (MulticastMessage.Flush) incoming;
 	        observe(flush.senderId, flush.lamportTimestamp);
 	        processFlushSet(flush.senderId, flush.crashedId, flush.pendingMessageIds);
-	        return; // CRUCIAL : Ne pas oublier ce return, sinon ClassCastException juste en dessous !
+	        return; 
 	      }
 	      
 	      MulticastMessage message = (MulticastMessage) incoming;

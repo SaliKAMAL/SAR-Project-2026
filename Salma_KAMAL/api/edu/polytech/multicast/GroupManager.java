@@ -71,12 +71,12 @@ public final class GroupManager {
             public void completed(Task t, Object o) {}
           });
         }
-        detectorReady.countDown(); // Signale que tous les listeners sont branchés
+        detectorReady.countDown(); // Signal that the failure detector is ready to monitor actors
       }
     });
 
     try {
-      detectorReady.await(); // On fige le démarrage du monde tant que le détecteur n'est pas prêt !
+      detectorReady.await(); // Wait for the failure detector to be ready before proceeding
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }

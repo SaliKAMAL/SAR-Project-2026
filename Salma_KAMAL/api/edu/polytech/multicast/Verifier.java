@@ -81,7 +81,9 @@ public final class Verifier {
 	    
     for (String actorId : survivorIds) {
       List<Delivery> deliveries = byActor.get(actorId);
-      if (deliveries == null) continue;
+      if (deliveries == null) {
+          deliveries = new java.util.ArrayList<Delivery>(); 
+      }
 
       if (reference == null) {
         reference = deliveries;
