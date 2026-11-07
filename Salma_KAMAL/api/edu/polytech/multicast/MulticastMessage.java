@@ -268,7 +268,7 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 	public final String senderId;
 	public final String crashedId;
     public final long lamportTimestamp;
-    public final long[] pendingMessageIds; // Les IDs des messages non délivrés du mort
+    public final long[] pendingMessageIds; // The list of message IDs that were pending at the time of the flush, which may not have been delivered to all actors yet.
 
 	public Flush(String senderId, String crashedId, long lamportTimestamp, long[] pendingMessageIds) {
 	  this.senderId = senderId;

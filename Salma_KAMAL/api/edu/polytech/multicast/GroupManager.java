@@ -67,7 +67,7 @@ public final class GroupManager {
         }
       });
     try {
-      detectorReady.await(); // On fige le démarrage du monde tant que le détecteur n'est pas prêt !
+      detectorReady.await(); // Wait for the failure detector to be ready before proceeding
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }

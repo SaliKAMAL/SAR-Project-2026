@@ -15,7 +15,6 @@ public final class Group {
   Group(List<String> memberIds) {
     List<String> sorted = new ArrayList<String>(memberIds);
     Collections.sort(sorted);
-    // CRUCIAL : La liste doit être mutable pour la Partie 2 !
     this.members = sorted;
   }
 
