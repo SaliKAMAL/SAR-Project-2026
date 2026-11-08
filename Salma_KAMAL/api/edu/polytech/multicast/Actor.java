@@ -57,6 +57,15 @@ public final class Actor {
   private boolean respawnFailable;
   private int linksToWait;
   
+  /** What to do when every queue asked by connectToMember is open. */
+  private Runnable afterLinks;
+  /** Generation of the member each queue of 'peers' leads to (used by a respawned actor). */
+  private final Map<String, Long> peerGeneration = new HashMap<String, Long>();
+  /** True from the start of our reinsertion until we are in the view. Only one actor holds it. */
+  private volatile boolean holdsTurn;
+  /** Crash flush messages about an actor whose reinsertion we have not installed yet. */
+  private final List<Object[]> deferredFlushes = new ArrayList<Object[]>();
+  
 //---- Part 3: reinsertion = a view change, at most one at a time ----
  /** What a view change is waiting for: the answer (ViewFlush) of every member and of the subject. */
  private static final class ViewChange {
@@ -114,6 +123,7 @@ public final class Actor {
   static long messageId(long generation, int index, long sequence) {
 	    return (generation << 48) | (((long) index) << 32) | sequence;
 	  }
+ 
   
   /** Part 3: listeners are told about resurrected and reinserted. */
   public void addListener(GroupListener listener) {
@@ -214,16 +224,100 @@ public final class Actor {
     task.post(new Runnable() {
       @Override
       public void run() {
-        beginOwnReinsertion();
+    	  startReinsertion();
       }
     });
   }
+  
+  private void startReinsertion() {
+	    if (state != State.RESPAWNED)
+	      return;
+	    if (!takeTurn()) { // another actor is being reinserted: one at a time
+	      task.post(new Runnable() {
+	        @Override
+	        public void run() {
+	          startReinsertion();
+	        }
+	      }, 5);
+	      return;
+	    }
+	    refreshConnections();
+	  }
+
+	  private boolean takeTurn() {
+	    synchronized (members) {
+	      for (Actor other : members)
+	        if (other != this && other.holdsTurn)
+	          return false;
+	      holdsTurn = true;
+	      return true;
+	    }
+	  }
+
+	  private void refreshConnections() {
+	    for (Iterator<Map.Entry<String, MessageQueue>> it = peers.entrySet().iterator(); it.hasNext();) {
+	      String peerId = it.next().getKey();
+	      Actor other = actorById(peerId);
+	      Long known = peerGeneration.get(peerId);
+	      if (other == null || other.state() != State.IN_VIEW || known == null
+	          || known.longValue() != other.generationId()) {
+	        it.remove();
+	        peerGeneration.remove(peerId);
+	      }
+	    }
+	    List<Actor> missing = new ArrayList<Actor>();
+	    for (Actor other : members)
+	      if (other != this && other.state() == State.IN_VIEW && !peers.containsKey(other.id))
+	        missing.add(other);
+	    linksToWait = missing.size();
+	    afterLinks = new Runnable() {
+	      @Override
+	      public void run() {
+	        beginOwnReinsertion();
+	      }
+	    };
+	    if (linksToWait == 0) {
+	      beginOwnReinsertion();
+	      return;
+	    }
+	    for (Actor other : missing)
+	      connectToMember(other);
+	  }
+
+	  private Actor actorById(String actorId) {
+	    for (Actor other : members)
+	      if (other.id.equals(actorId))
+	        return other;
+	    return null;
+	  }
+
+	  private boolean memberGone(String memberId) {
+	    Actor other = actorById(memberId);
+	    if (other == null || other.task().dead())
+	      return true;
+	    Long known = peerGeneration.get(memberId);
+	    return known != null && known.longValue() != other.generationId();
+	  }
+
+	  private boolean subjectGone(String subjectId, long subjectGeneration) {
+	    Actor other = actorById(subjectId);
+	    return other != null && (other.generationId() != subjectGeneration || other.task().dead());
+	  }
 
   /**
    * Runs on the task of the respawned actor. It asks every member to change the view and gives its
    * own answer to the flush. It is installed in the view when it has the answer of every member.
    */
   private void beginOwnReinsertion() {
+	    if (state != State.RESPAWNED)
+	        return;
+	      for (Iterator<Map.Entry<String, MessageQueue>> it = peers.entrySet().iterator(); it.hasNext();) {
+	        String peerId = it.next().getKey();
+	        if (memberGone(peerId)) {
+	          it.remove();
+	          peerGeneration.remove(peerId);
+	        }
+	      }
     ViewChange change = new ViewChange(id, generationId);
     change.expected.addAll(peers.keySet());
     change.expected.add(id);
@@ -252,14 +346,17 @@ public final class Actor {
     group.reset(change.expected);
     acceptedGeneration.clear();
     for (MulticastMessage.ViewFlush reply : change.replies.values()) {
-      acceptedGeneration.put(reply.senderId, Long.valueOf(reply.senderGeneration));
-      raiseLastSeen(reply.senderId, view);
+        if (!change.expected.contains(reply.senderId))
+            continue; // a member that died: it is not in our view
+        acceptedGeneration.put(reply.senderId, Long.valueOf(reply.senderGeneration));
+        raiseLastSeen(reply.senderId, view);
     }
     viewChange = null;
     synchronized (this) {
       reinserting = false;
       state = State.IN_VIEW;
     }
+    holdsTurn = false;
     for (GroupListener listener : listeners)
       listener.reinserted(id);
     verifier.reinserted(id);
@@ -284,7 +381,9 @@ public final class Actor {
     if (state == State.RESPAWNED) { // we only wait for the answers to our own request
       if (message instanceof MulticastMessage.ViewFlush && viewChange != null) {
         MulticastMessage.ViewFlush reply = (MulticastMessage.ViewFlush) message;
-        viewChange.replies.put(reply.senderId, reply);
+        Long known = peerGeneration.get(reply.senderId);
+        if (known != null && known.longValue() == reply.senderGeneration)
+          viewChange.replies.put(reply.senderId, reply);
         completeOwnReinsertionIfReady();
       }
       return;
@@ -322,6 +421,8 @@ public final class Actor {
     ViewChange change = new ViewChange(subject, subjectGeneration);
     change.expected.addAll(group.members());
     change.expected.add(subject);
+    if (subjectGone(subject, subjectGeneration))
+        change.expected.remove(subject);
     viewChange = change;
     frozen = true;
     long timestamp = task.logicalClock();
@@ -354,6 +455,9 @@ public final class Actor {
       peers.put(change.subjectId, back);
     viewChange = null;
     frozen = false;
+    if (subjectGone(change.subjectId, change.subjectGeneration))
+        onCrashNotice(change.subjectId);
+      replayDeferredFlushes();
     tryDeliver();
     // from the next runnable on, our timestamps are greater than the view timestamp
     task.post(new Runnable() {
@@ -363,6 +467,27 @@ public final class Actor {
       }
     });
   }
+  private boolean waitingToInstall(String actorId) {
+	    if (viewChange != null && viewChange.subjectId.equals(actorId))
+	      return true;
+	    for (Object message : deferredViewMessages) {
+	      String subject = message instanceof MulticastMessage.ReinsertRequest
+	          ? ((MulticastMessage.ReinsertRequest) message).requesterId
+	          : ((MulticastMessage.ViewFlush) message).subjectId;
+	      if (subject.equals(actorId))
+	        return true;
+	    }
+	    return false;
+	  }
+
+	  private void replayDeferredFlushes() {
+	    if (deferredFlushes.isEmpty())
+	      return;
+	    List<Object[]> flushes = new ArrayList<Object[]>(deferredFlushes);
+	    deferredFlushes.clear();
+	    for (Object[] flush : flushes)
+	      processFlushSet((String) flush[0], (String) flush[1], (long[]) flush[2]);
+	  }
 
   private void resumeAfterViewChange() {
     if (state != State.IN_VIEW || frozen)
@@ -460,7 +585,8 @@ public final class Actor {
 
 	  /** Called by the failure detector when the task of this actor is dead. */
 	  void markDead() {
-	    state = State.DEAD;
+		  holdsTurn = false;
+	      state = State.DEAD;
 	  }
 
 	  String brokerName() {
@@ -503,6 +629,9 @@ public final class Actor {
 	    flushSets.clear();
 	    peers.clear();
 	    rejoinQueues.clear();
+	    peerGeneration.clear();
+	    deferredFlushes.clear();
+	    holdsTurn = false;
 	    viewChange = null;                
 	    frozen = false;                   
 	    reinserting = false;              
@@ -513,33 +642,46 @@ public final class Actor {
 	    broker = task.newBroker(brokerName); // a broker name can not be used twice
 	    bindRejoinPorts();
 	    linksToWait = 0;
-	    for (Actor other : members) {
-	      if (other == this || other.state() != State.IN_VIEW)
-	        continue;
-	      linksToWait++;
-	      connectToMember(other);
-	    }
+	    afterLinks = new Runnable() {
+	      @Override
+	      public void run() {
+	        finishRespawn();
+	      }
+	    };
+	    List<Actor> inView = new ArrayList<Actor>();
+	    for (Actor other : members)
+	      if (other != this && other.state() == State.IN_VIEW)
+	        inView.add(other);
+	    linksToWait = inView.size();
 	    if (linksToWait == 0)
 	      finishRespawn();
+	    for (Actor other : inView)
+	      connectToMember(other);
 	  }
 
 	  private void connectToMember(final Actor other) {
+	    final long generation = other.generationId();
 	    boolean started = broker.connect(other.brokerName(), REJOIN_PORT_BASE + index, new ConnectListener() {
 	      @Override
 	      public void connected(MessageQueue queue) {
 	        peers.put(other.id, queue);
+	        peerGeneration.put(other.id, Long.valueOf(generation));
 	        queue.setListener(listener());
-	        if (--linksToWait == 0)
-	          finishRespawn();
+	        oneLinkDone();
 	      }
 
 	      @Override
 	      public void refused() {
-	        throw new IllegalStateException(id + " was refused by " + other.id);
+	        oneLinkDone();
 	      }
 	    });
 	    if (!started)
-	      throw new IllegalStateException(id + " could not reach " + other.id);
+	      oneLinkDone();
+	  }
+
+	  private void oneLinkDone() {
+	    if (--linksToWait == 0)
+	      afterLinks.run();
 	  }
 
 	  private void finishRespawn() {
@@ -587,8 +729,25 @@ public final class Actor {
    * It starts the flush phase by broadcasting its pending messages from the crashed sender.
    */
   void onCrashNotice(String crashedId) {
-	  if (state != State.IN_VIEW)
-		  return; // outside the view: not part of the flush
+	    if (state == State.RESPAWNED) {
+	        ViewChange change = viewChange;
+	        if (change != null && !crashedId.equals(id) && change.expected.contains(crashedId) && memberGone(crashedId)) {
+	          change.expected.remove(crashedId);
+	          change.replies.remove(crashedId);
+	          completeOwnReinsertionIfReady();
+	        }
+	        return;
+	      }
+	      if (state != State.IN_VIEW)
+	        return;
+	      ViewChange pendingChange = viewChange;
+	      if (pendingChange != null && pendingChange.subjectId.equals(crashedId) && !group.members().contains(crashedId)) {
+	        if (subjectGone(pendingChange.subjectId, pendingChange.subjectGeneration)) {
+	          pendingChange.expected.remove(crashedId);
+	          completeViewChangeIfReady();
+	        }
+	        return;
+	      }
     try {
       if (!group.members().contains(crashedId) || flushingDeadActors.contains(crashedId)) {
         return;
@@ -628,9 +787,11 @@ public final class Actor {
    * Part 2: Collect flush sets from survivors.
    */
   private void processFlushSet(String senderId, String crashedId, long[] pendingIds) {
-    if (!group.members().contains(crashedId)) {
-      return; // Already resolved
-    }
+	    if (!group.members().contains(crashedId)) {
+	        if (waitingToInstall(crashedId))
+	          deferredFlushes.add(new Object[] { senderId, crashedId, pendingIds });
+	        return; // Already resolved
+	      }
 
     java.util.Map<String, java.util.Set<Long>> setsForDead = flushSets.get(crashedId);
     if (setsForDead == null) {
