@@ -169,7 +169,7 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
         if (kind == REINSERT_REQUEST)
             return new ReinsertRequest(in.readUTF(), in.readLong(), in.readLong());
         if (kind == VIEW_FLUSH)
-            return new ViewFlush(in.readUTF(), in.readLong(), in.readUTF(), in.readLong(), in.readLong());
+            return new ViewFlush(in.readUTF(), in.readLong(), in.readUTF(), in.readLong(), in.readLong(), in.readLong());
         throw new IllegalArgumentException("unknown message kind " + kind);
     } catch (IOException ex) {
     	throw new IllegalArgumentException(ex);
@@ -194,13 +194,15 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 	    final String subjectId;
 	    final long subjectGeneration;
 	    final long lamportTimestamp;
+	    final long viewId;
 
-	    ViewFlush(String senderId, long senderGeneration, String subjectId, long subjectGeneration,long lamportTimestamp) {
+	    ViewFlush(String senderId, long senderGeneration, String subjectId, long subjectGeneration, long lamportTimestamp, long viewId) {
 	      this.senderId = senderId;
 	      this.senderGeneration = senderGeneration;
 	      this.subjectId = subjectId;
 	      this.subjectGeneration = subjectGeneration;
 	      this.lamportTimestamp = lamportTimestamp;
+	      this.viewId = viewId;
 	    }
 	  }
 	  
@@ -225,7 +227,7 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 	   * another member, it also has every message that member sent before. It is a barrier.
 	   */
 	  static byte[] encodeViewFlush(String senderId, long senderGeneration, String subjectId,
-	      long subjectGeneration, long lamportTimestamp) {
+	      long subjectGeneration, long lamportTimestamp, long viewId) {
 	    try {
 	      ByteArrayOutputStream raw = new ByteArrayOutputStream();
 	      DataOutputStream out = new DataOutputStream(raw);
@@ -235,6 +237,7 @@ public final class MulticastMessage implements Comparable<MulticastMessage> {
 	      out.writeUTF(subjectId);
 	      out.writeLong(subjectGeneration);
 	      out.writeLong(lamportTimestamp);
+	      out.writeLong(viewId);
 	      out.flush();
 	      return raw.toByteArray();
 	    } catch (IOException ex) {

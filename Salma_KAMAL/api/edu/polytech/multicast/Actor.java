@@ -7,6 +7,9 @@ import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.List;
+import java.util.Collections;
+
+import edu.polytech.multicast.MembershipMessage.Type;
 
 import edu.polytech.queues.MessageQueue;
 import edu.polytech.queues.QueueBroker;
@@ -20,7 +23,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * One group member. It owns a single task and talks to the others only through
- * message queues. In this part the member never leaves and never crashes.
+ * message queues. Membership changes run on the actor's private task.
  */
 public final class Actor {
 
@@ -29,7 +32,8 @@ public final class Actor {
   private volatile Task task;
   private final Group group;
   private final Verifier verifier;
-  private final Actor[] members;
+  private volatile Actor[] members;
+  private final MembershipRuntime runtime;
   private final int period;
   private final int messagesToSend;
   private final Map<String, MessageQueue> peers = new HashMap<String, MessageQueue>();
@@ -43,7 +47,7 @@ public final class Actor {
   private final Set<String> flushingDeadActors = new HashSet<String>();
   private final Map<String, Map<String, Set<Long>>> flushSets = new HashMap<String, Map<String, Set<Long>>>();
   
-  public enum State { IN_VIEW,DEAD,RESPAWNED}
+  public enum State { CREATED, JOINING, IN_VIEW, LEAVING, LEFT, DEAD, RESPAWNED }
   private volatile State state = State.IN_VIEW;
   private volatile long generationId=1L;
   
@@ -97,6 +101,22 @@ public final class Actor {
   private static final long MANUAL_ID_BIT = 1L << 31;
   private int manualSent;
 
+  private long viewId;
+  private volatile List<String> currentView;
+  private volatile boolean membershipRequested;
+  private volatile MembershipChange membership;
+  private MembershipChange previousMembership;
+  private MembershipRequest ownRequest;
+  private MembershipMessage pendingRequest;
+  private final Map<String, Long> failedMembers = new HashMap<>();
+  private final Map<String, Long> cancelledViews = new HashMap<>();
+  private final Map<String, MessageQueue> joinQueues = new HashMap<>();
+  private final List<MulticastMessage.Flush> deferredCrashFlushes = new ArrayList<>();
+  private volatile boolean resolvingCrashes;
+  private String joinPeerId;
+  private long admissionTimestamp = -1;
+  private static final int MEMBERSHIP_PORT = -1;
+
   Actor(String id, int index, Task task, Group group, Verifier verifier, Actor[] members, int period,
       int messagesToSend) {
     this.id = id;
@@ -110,8 +130,27 @@ public final class Actor {
     this.members = members;
     this.period = period;
     this.messagesToSend = messagesToSend;
+    publishView();
+    state = group.members().isEmpty() ? State.CREATED : State.IN_VIEW;
+    runtime = members.length > 0 && members[0] != null ? members[0].runtime : new MembershipRuntime(verifier);
+    runtime.register(this);
+    listeners.add(new GroupListener() {
+      public void joined(String actorId) { }
+      public void left(String actorId) { }
+      public void crashed(String actorId) { }
+      public void reinserted(String actorId) {
+        if (id.equals(actorId))
+          verifier.resumed(id);
+      }
+      public void resurrected(String actorId) {
+        if (id.equals(actorId)) {
+          resetMembership();
+          openMembershipPort();
+        }
+      }
+    });
   }
-    
+
   public String id() {
     return id;
   }
@@ -156,6 +195,9 @@ public final class Actor {
   }
   
   public void multicast(final byte[] payload) {
+    if (state == State.CREATED || state == State.JOINING || state == State.LEAVING
+        || state == State.LEFT || membershipRequested)
+      throw new IllegalStateException(id + " cannot multicast from " + state);
 	    final byte[] copy = payload.clone();
 	    task.post(new Runnable() {
 	      @Override
@@ -173,8 +215,543 @@ public final class Actor {
 	  return generationId;
   }
 
+  public List<String> view() { 
+    return currentView; 
+  }
+
+  private void publishView() {
+    currentView = Collections.unmodifiableList(new ArrayList<>(group.members()));
+  }
+
+  /** Creates a task outside the group. The caller requests admission with join(peerId). */
+  public Actor newActor(String actorId) { 
+    return runtime.create(actorId); 
+  }
+
+  void setRuntimeActors(Actor[] actors) {
+    members = actors;
+  }
+
+  /** The caller waits for every participant before requesting another membership change. */
+  public boolean membershipComplete() { 
+    return membership == null && !membershipRequested && !resolvingCrashes; 
+  }
+  public boolean leaveComplete() { 
+    return state == State.LEFT && membershipComplete(); 
+  }
+
+  public void join(String peerId) {
+    runtime.brokerName(peerId);
+    synchronized (this) {
+      if (state != State.CREATED || membershipRequested || id.equals(peerId))
+        throw new IllegalStateException(id + " cannot join from " + state);
+      membershipRequested = true;
+    }
+    task.post(new Runnable() {
+      public void run() {
+        state = State.JOINING;
+        joinPeerId = peerId;
+        ownRequest = new MembershipRequest(id + "@" + generationId + ":join", MembershipRequest.Operation.JOIN, id, generationId, 0);
+        connectJoinPeer();
+      }
+    });
+  }
+
+  public void leave() {
+    synchronized (this) {
+      if (state != State.IN_VIEW || membershipRequested)
+        throw new IllegalStateException(id + " cannot leave from " + state);
+      membershipRequested = true;
+    }
+    task.post(new Runnable() {
+      public void run() {
+        state = State.LEAVING;
+        ownRequest = null;
+        submitLeaveRequest();
+      }
+    });
+  }
+
+  private void connectJoinPeer() {
+    final String peerId = joinPeerId;
+    broker.connect(runtime.brokerName(peerId), MEMBERSHIP_PORT, new ConnectListener() {
+      public void connected(MessageQueue queue) {
+        joinQueues.put(peerId, queue);
+        queue.setListener(joinListener(peerId, queue));
+        sendPeer(peerId, frame(Type.JOIN_REQUEST, ownRequest, acceptedGeneration, task.logicalClock()).encode());
+      }
+      public void refused() { 
+        retryJoin(peerId); 
+      }
+    });
+  }
+
+  private void retryJoin(String excluded) {
+    for (String peerId : acceptedGeneration.keySet()) {
+      if (!peerId.equals(excluded) && !acceptedGeneration.get(peerId).equals(failedMembers.get(peerId))) {
+        joinPeerId = peerId;
+        connectJoinPeer();
+        return;
+      }
+    }
+    joinPeerId = null;
+    membershipRequested = false;
+    state = State.CREATED;
+  }
+
+  private MessageQueue.Listener joinListener(final String peerId, final MessageQueue queue) {
+    return new MessageQueue.Listener() {
+      public void received(byte[] bytes) { onReceive(bytes); }
+      public void closed() {
+        if (state == State.JOINING && membership == null && peerId.equals(joinPeerId)
+            && joinQueues.get(peerId) == queue)
+          retryJoin(peerId);
+      }
+    };
+  }
+
+  private void openMembershipPort() {
+    broker.bind(MEMBERSHIP_PORT, new BindListener() {
+      public void accepted(final MessageQueue queue) {
+        queue.setListener(new MessageQueue.Listener() {
+          public void received(byte[] bytes) {
+            String peerId = MembershipMessage.decode(bytes).senderId;
+            joinQueues.put(peerId, queue);
+            queue.setListener(joinListener(peerId, queue));
+            onReceive(bytes);
+          }
+          public void closed() { }
+        });
+      }
+      public void unbound() { }
+    });
+    if (state == State.CREATED)
+      bindRejoinPorts();
+    runtime.watch(this, detectorTask);
+  }
+
+  private void submitLeaveRequest() {
+    if (state != State.LEAVING || ownRequest != null || membership != null || viewChange != null
+        || !flushingDeadActors.isEmpty())
+      return;
+    ownRequest = new MembershipRequest(id + "@" + generationId + ":leave", MembershipRequest.Operation.LEAVE, id, generationId, viewId);
+    startMembership(ownRequest, acceptedGeneration);
+    if (membership != null && !membership.recovering) {
+      sendMembership(reply(Type.REQUEST, task.logicalClock()));
+      advanceMembership();
+    }
+  }
+
+  private void introduceJoin(MembershipMessage message) {
+    if (state != State.IN_VIEW || membership != null || viewChange != null) {
+      sendPeer(message.request.actorId(), frame(Type.REJECT, message.request, acceptedGeneration, 0).encode());
+      return;
+    }
+    if (!flushingDeadActors.isEmpty()) {
+      pendingRequest = message;
+      return;
+    }
+    MembershipRequest request = new MembershipRequest(message.request.requestId(), MembershipRequest.Operation.JOIN, message.request.actorId(), message.request.generationId(), viewId);
+    if (acceptedGeneration.containsKey(request.actorId()) || cancelled(request))
+      return;
+    startMembership(request, acceptedGeneration);
+    if (membership != null && !membership.recovering) {
+      sendMembership(reply(Type.REQUEST, task.logicalClock()));
+      advanceMembership();
+    }
+  }
+
+  private void startMembership(MembershipRequest request, Map<String, Long> oldMembers) {
+    membership = new MembershipChange(request, oldMembers);
+    frozen = true;
+    if (state == State.JOINING) {
+      acceptedGeneration.clear();
+      acceptedGeneration.putAll(oldMembers);
+    } else if (request.operation() == MembershipRequest.Operation.JOIN
+        && !Long.valueOf(request.generationId()).equals(failedMembers.get(request.actorId()))) {
+      connectNewcomer();
+    }
+    for (Map.Entry<String, Long> participant : membership.participants.entrySet()) {
+      if (participant.getValue().equals(failedMembers.get(participant.getKey()))) {
+        beginMembershipRecovery();
+        return;
+      }
+    }
+  }
+
+  private void connectNewcomer() {
+    final MembershipChange change = membership;
+    final String subject = change.request.actorId();
+    for (Actor actor : members) {
+      if (actor.id.equals(subject)) {
+        broker.bind(REJOIN_PORT_BASE + actor.index, new BindListener() {
+          public void accepted(MessageQueue queue) {
+            rejoinQueues.put(subject, queue);
+            queue.setListener(listener());
+          }
+          public void unbound() { }
+        });
+      }
+    }
+    MessageQueue existing = joinQueues.get(subject);
+    if (existing != null && !existing.closed()) {
+      sendPeer(subject, reply(Type.REQUEST, task.logicalClock()).encode());
+      return;
+    }
+    broker.connect(runtime.brokerName(subject), MEMBERSHIP_PORT, new ConnectListener() {
+      public void connected(MessageQueue queue) {
+        if (membership != change) {
+          queue.close();
+          return;
+        }
+        joinQueues.put(subject, queue);
+        queue.setListener(joinListener(subject, queue));
+        sendPeer(subject, reply(Type.REQUEST, task.logicalClock()).encode());
+        if (membership.recovering)
+          sendMembership(membership.statuses.get(id));
+        advanceMembership();
+      }
+      public void refused() { 
+        onCrashNotice(subject); 
+      }
+    });
+  }
+
+  private MembershipMessage frame(Type type, MembershipRequest request, Map<String, Long> oldMembers, long clock) {
+    return new MembershipMessage(type, request, id, generationId, oldMembers, new HashMap<String, Long>(), clock, false);
+  }
+
+  private MembershipMessage reply(Type type, long clock) {
+    return new MembershipMessage(type, membership.request, id, generationId, membership.members,
+        membership.recovering ? membership.survivors : new HashMap<String, Long>(), clock, membership.applied);
+  }
+
+  private void sendPeer(String peerId, byte[] bytes) {
+    if (peerId.equals(id))
+      return;
+    MessageQueue queue = peers.get(peerId);
+    if (queue == null)
+      queue = joinQueues.get(peerId);
+    if (queue != null)
+      queue.send(bytes, 0, bytes.length, null);
+  }
+
+  private void sendMembership(MembershipMessage message) {
+    Map<String, Long> targets = message.type == Type.FLUSH ? membership.members : membership.participants;
+    if (!message.survivors.isEmpty())
+      targets = message.survivors;
+    byte[] bytes = message.encode();
+    for (String peerId : targets.keySet())
+      sendPeer(peerId, bytes);
+  }
+
+  private boolean cancelled(MembershipRequest request) {
+    Long view = cancelledViews.get(request.requestId());
+    return view != null && request.viewId() <= view;
+  }
+
+  private void receiveMembership(byte[] bytes) {
+    MembershipMessage message = MembershipMessage.decode(bytes);
+    if (message.type == Type.JOIN_REQUEST) {
+      introduceJoin(message);
+      return;
+    }
+    if (message.type == Type.REJECT) {
+      if (state == State.JOINING && membership == null) {
+        membershipRequested = false;
+        joinPeerId = null;
+        state = State.CREATED;
+      }
+      return;
+    }
+    if (cancelled(message.request) && message.type != Type.STATUS)
+      return;
+    if (membership != null && !membership.request.equals(message.request)) {
+      if (message.type == Type.REQUEST && message.request.viewId() > membership.request.viewId())
+        pendingRequest = message;
+      return;
+    }
+    if (membership == null) {
+      if (message.type == Type.STATUS && previousMembership != null
+          && previousMembership.request.equals(message.request)) {
+        if (previousMembership.resolved && previousMembership.survivors.equals(message.survivors)) {
+          sendPeer(message.senderId, new MembershipMessage(Type.CONFIRM, previousMembership.request,
+              id, generationId, previousMembership.members, previousMembership.survivors,
+              previousMembership.boundary, previousMembership.applied).encode());
+          return;
+        }
+        membership = previousMembership;
+      } else {
+        if (message.request.viewId() < viewId || message.type == Type.CONFIRM)
+          return;
+        if (!Long.valueOf(generationId).equals(message.members.get(id)) && state != State.JOINING)
+          return;
+        startMembership(message.request, message.members);
+      }
+    }
+    if (membership == null)
+      return;
+    if (message.type == Type.STATUS) {
+      for (Map.Entry<String, Long> actor : membership.participants.entrySet())
+        if (!message.survivors.containsKey(actor.getKey()))
+          failedMembers.put(actor.getKey(), actor.getValue());
+      if (!membership.recovering || !membership.survivors.equals(message.survivors))
+        beginMembershipRecovery();
+    }
+    if (membership != null) {
+      membership.record(message);
+      if (message.type == Type.REQUEST && membership.recovering) {
+        sendPeer(message.senderId, membership.statuses.get(id).encode());
+        if (membership.resolved)
+          sendPeer(message.senderId, reply(Type.CONFIRM, membership.boundary).encode());
+      }
+      advanceMembership();
+    }
+  }
+
+  private void advanceMembership() {
+    if (membership == null || resolvingCrashes)
+      return;
+    if (membership.recovering) {
+      advanceMembershipRecovery();
+      return;
+    }
+    boolean newcomer = state == State.JOINING;
+    if (!newcomer && !membership.markers.contains(id)) {
+      MembershipMessage marker = reply(Type.FLUSH, task.logicalClock());
+      membership.record(marker);
+      sendMembership(marker);
+    }
+    if (!membership.clocks.containsKey(id) && (newcomer ? joinQueues.keySet().containsAll(membership.members.keySet()) : membership.allMarkers())) {
+      if (!newcomer) {
+        List<MulticastMessage> messages = new ArrayList<>(pending);
+        Collections.sort(messages);
+        for (MulticastMessage message : messages) {
+          task.witness(message.lamportTimestamp());
+          if (deliveredIds.add(message.messageId()))
+            verifier.delivered(id, message.messageId(), message.payload());
+        }
+      }
+      MembershipMessage ready = reply(Type.READY, task.logicalClock());
+      membership.record(ready);
+      sendMembership(ready);
+    }
+    if (membership.allClocks() && !membership.applied) {
+      membership.boundary = membership.chooseBoundary();
+      applyMembership();
+      MembershipMessage confirmation = reply(Type.CONFIRM, membership.boundary);
+      membership.record(confirmation);
+      sendMembership(confirmation);
+    }
+    if (membership.allInstalled()) {
+      notifyMembership();
+      finishMembership();
+    }
+  }
+
+  private void applyMembership() {
+    MembershipChange change = membership;
+    task.witness(change.boundary);
+    group.reset(change.nextMembers.keySet());
+    acceptedGeneration.clear();
+    acceptedGeneration.putAll(change.nextMembers);
+    lastSeen.keySet().retainAll(change.nextMembers.keySet());
+    for (String actorId : change.nextMembers.keySet()) {
+      MessageQueue queue = joinQueues.remove(actorId);
+      if (queue != null)
+        peers.put(actorId, queue);
+      raiseLastSeen(actorId, change.boundary);
+    }
+    viewId = change.request.viewId() + 1;
+    change.applied = true;
+    publishView();
+  }
+
+  private void notifyMembership() {
+    if (membership.notified || !membership.applied)
+      return;
+    String subject = membership.request.actorId();
+    boolean joining = membership.request.operation() == MembershipRequest.Operation.JOIN;
+    if (id.equals(subject)) {
+      state = joining ? State.IN_VIEW : State.LEFT;
+      if (joining)
+        admissionTimestamp = membership.boundary;
+    }
+    if (joining)
+      verifier.joined(subject);
+    else
+      verifier.left(subject);
+    for (GroupListener listener : listeners) {
+      if (joining) listener.joined(subject);
+      else listener.left(subject);
+    }
+    membership.notified = true;
+  }
+
+  private void finishMembership() {
+    MembershipChange finished = membership;
+    previousMembership = finished;
+    if (!finished.applied) {
+      cancelledViews.put(finished.request.requestId(), finished.request.viewId());
+      MessageQueue queue = joinQueues.remove(finished.request.actorId());
+      if (queue != null)
+        queue.close();
+    }
+    Iterator<MulticastMessage> iterator = pending.iterator();
+    while (iterator.hasNext())
+      if (deliveredIds.contains(iterator.next().messageId()))
+        iterator.remove();
+    frozen = false;
+    if (state == State.LEFT) {
+      deferredSends.clear();
+      for (MessageQueue queue : peers.values()) queue.close();
+      peers.clear();
+      closeJoinQueues();
+    } else if (finished.applied
+        && finished.request.operation() == MembershipRequest.Operation.LEAVE) {
+      peers.remove(finished.request.actorId());
+    }
+    membership = null;
+    if (state == State.JOINING) {
+      closeJoinQueues();
+      retryJoin(joinPeerId);
+      return;
+    }
+    if (state == State.LEAVING)
+      ownRequest = null;
+    else
+      membershipRequested = false;
+    if (state == State.LEFT)
+      return;
+    task.post(new Runnable() {
+      public void run() {
+        resumeAfterViewChange();
+        submitPendingRequest();
+      }
+    });
+  }
+
+  private void closeJoinQueues() {
+    for (MessageQueue queue : joinQueues.values()) queue.close();
+    joinQueues.clear();
+  }
+
+  private void submitPendingRequest() {
+    if (pendingRequest == null || membership != null || viewChange != null || !flushingDeadActors.isEmpty())
+      return;
+    MembershipMessage message = pendingRequest;
+    pendingRequest = null;
+    if (message.type == Type.JOIN_REQUEST) introduceJoin(message);
+    else receiveMembership(message.encode());
+  }
+
+  private boolean handleMembershipCrash(String crashedId) {
+    Long generation = acceptedGeneration.get(crashedId);
+    if (generation == null && membership != null)
+      generation = membership.participants.get(crashedId);
+    failedMembers.put(crashedId, generation == null ? 1L : generation);
+    if (state == State.JOINING && membership == null) {
+      if (crashedId.equals(joinPeerId)) retryJoin(crashedId);
+      return true;
+    }
+    if (state != State.IN_VIEW && state != State.LEAVING && state != State.JOINING)
+      return true;
+    if (membership == null || resolvingCrashes)
+      return false;
+    beginMembershipRecovery();
+    return true;
+  }
+
+  private boolean membershipRecovering() { return membership != null && membership.recovering; }
+
+  private void beginMembershipRecovery() {
+    Map<String, Long> survivors = new HashMap<>(membership.participants);
+    for (Map.Entry<String, Long> failed : failedMembers.entrySet())
+      if (failed.getValue().equals(survivors.get(failed.getKey())))
+        survivors.remove(failed.getKey());
+    if (membership.recovering && membership.survivors.equals(survivors))
+      return;
+    resolvingCrashes = false;
+    frozen = true;
+    membership.beginRecovery(survivors);
+    MembershipMessage status = reply(Type.STATUS, membership.applied ? membership.boundary : -1);
+    membership.record(status);
+    sendMembership(status);
+    advanceMembership();
+  }
+
+  private void advanceMembershipRecovery() {
+    if (!membership.everyoneReported())
+      return;
+    if (!membership.resolved) {
+      membership.resolve();
+      if (membership.boundary >= 0 && !membership.applied)
+        applyMembership();
+      MembershipMessage confirmation = reply(Type.CONFIRM, membership.boundary);
+      membership.record(confirmation);
+      sendMembership(confirmation);
+    }
+    if (!membership.recoveryComplete())
+      return;
+    membership.recovering = false;
+    if (membership.boundary >= 0)
+      notifyMembership();
+    if (!group.members().contains(id)) {
+      deferredCrashFlushes.clear();
+      finishMembership();
+      return;
+    }
+    resolvingCrashes = true;
+    for (String failed : failedMembers.keySet())
+      if (failedMembers.get(failed).equals(acceptedGeneration.get(failed)))
+        onCrashNotice(failed);
+    List<MulticastMessage.Flush> flushes = new ArrayList<>(deferredCrashFlushes);
+    deferredCrashFlushes.clear();
+    for (MulticastMessage.Flush flush : flushes)
+      processFlushSet(flush.senderId, flush.crashedId, flush.pendingMessageIds);
+    finishCrashRecoveryIfReady();
+  }
+
+  private boolean deferCrashFlush(MulticastMessage.Flush flush) {
+    if (membership == null || resolvingCrashes)
+      return false;
+    onCrashNotice(flush.crashedId);
+    deferredCrashFlushes.add(flush);
+    return true;
+  }
+
+  private void finishCrashRecoveryIfReady() {
+    if (!flushingDeadActors.isEmpty())
+      return;
+    if (resolvingCrashes) {
+      for (String failed : failedMembers.keySet())
+        if (failedMembers.get(failed).equals(acceptedGeneration.get(failed)))
+          return;
+      resolvingCrashes = false;
+      finishMembership();
+    } else {
+      submitPendingRequest();
+    }
+  }
+
+  private void resetMembership() {
+    membership = null;
+    previousMembership = null;
+    ownRequest = null;
+    pendingRequest = null;
+    membershipRequested = false;
+    resolvingCrashes = false;
+    failedMembers.clear();
+    cancelledViews.clear();
+    deferredCrashFlushes.clear();
+    closeJoinQueues();
+    joinPeerId = null;
+    admissionTimestamp = -1;
+  }
+
   void openBroker() {
     broker = task.newBroker(id);
+    openMembershipPort();
   }
   
   /**
@@ -324,12 +901,12 @@ public final class Actor {
     viewChange = change;
     long timestamp = task.logicalClock();
     byte[] request = MulticastMessage.encodeReinsertRequest(id, generationId, timestamp);
-    byte[] flush = MulticastMessage.encodeViewFlush(id, generationId, id, generationId, timestamp);
+    byte[] flush = MulticastMessage.encodeViewFlush(id, generationId, id, generationId, timestamp, viewId);
     for (MessageQueue peer : peers.values()) {
       peer.send(request, 0, request.length, null);
       peer.send(flush, 0, flush.length, null);
     }
-    change.replies.put(id, new MulticastMessage.ViewFlush(id, generationId, id, generationId, timestamp));
+    change.replies.put(id, new MulticastMessage.ViewFlush(id, generationId, id, generationId, timestamp, viewId));
     completeOwnReinsertionIfReady();
   }
 
@@ -344,6 +921,8 @@ public final class Actor {
       if (it.next().lamportTimestamp() <= view)
         it.remove();
     group.reset(change.expected);
+    viewId = nextViewId(change);
+    publishView();
     acceptedGeneration.clear();
     for (MulticastMessage.ViewFlush reply : change.replies.values()) {
         if (!change.expected.contains(reply.senderId))
@@ -364,7 +943,7 @@ public final class Actor {
     task.post(new Runnable() {
       @Override
       public void run() {
-        if (state != State.IN_VIEW)
+        if (state != State.IN_VIEW && state != State.LEAVING)
           return;
         acknowledge(); // tells the members we are there, so nobody waits for us
         tryDeliver();
@@ -378,6 +957,10 @@ public final class Actor {
         ? ((MulticastMessage.ReinsertRequest) message).lamportTimestamp
         : ((MulticastMessage.ViewFlush) message).lamportTimestamp;
     task.witness(timestamp);
+    if (membership != null || resolvingCrashes) {
+      deferredViewMessages.add(message);
+      return;
+    }
     if (state == State.RESPAWNED) { // we only wait for the answers to our own request
       if (message instanceof MulticastMessage.ViewFlush && viewChange != null) {
         MulticastMessage.ViewFlush reply = (MulticastMessage.ViewFlush) message;
@@ -388,7 +971,7 @@ public final class Actor {
       }
       return;
     }
-    if (state != State.IN_VIEW)
+    if (state != State.IN_VIEW && state != State.LEAVING)
       return;
     String subject;
     long subjectGeneration;
@@ -427,12 +1010,12 @@ public final class Actor {
     frozen = true;
     long timestamp = task.logicalClock();
     observe(id, timestamp);
-    byte[] flush = MulticastMessage.encodeViewFlush(id, generationId, subject, subjectGeneration, timestamp);
+    byte[] flush = MulticastMessage.encodeViewFlush(id, generationId, subject, subjectGeneration, timestamp, viewId);
     broadcast(flush);
     MessageQueue back = rejoinQueues.get(subject);
     if (back != null)
       back.send(flush, 0, flush.length, null);
-    change.replies.put(id, new MulticastMessage.ViewFlush(id, generationId, subject, subjectGeneration, timestamp));
+    change.replies.put(id, new MulticastMessage.ViewFlush(id, generationId, subject, subjectGeneration, timestamp, viewId));
   }
 
   /**
@@ -448,6 +1031,8 @@ public final class Actor {
     task.witness(view);
     deliverUpTo(view);
     group.add(change.subjectId);
+    viewId = nextViewId(change);
+    publishView();
     acceptedGeneration.put(change.subjectId, Long.valueOf(change.subjectGeneration));
     raiseLastSeen(change.subjectId, view);
     MessageQueue back = rejoinQueues.remove(change.subjectId);
@@ -490,7 +1075,11 @@ public final class Actor {
 	  }
 
   private void resumeAfterViewChange() {
-    if (state != State.IN_VIEW || frozen)
+    if ((state != State.IN_VIEW && state != State.LEAVING) || frozen || membership != null
+        || resolvingCrashes)
+      return;
+    submitLeaveRequest();
+    if (membership != null)
       return;
     // Tell everybody, the actor that came back included, how far we have seen. Without this, an ack
     // sent before the view was installed never reached the new member, and it could wait forever.
@@ -511,7 +1100,7 @@ public final class Actor {
   }
 
   private void redispatchDeferredViewMessages() {
-    if (viewChange != null || deferredViewMessages.isEmpty())
+    if (viewChange != null || membership != null || resolvingCrashes || deferredViewMessages.isEmpty())
       return;
     List<Object> messages = new ArrayList<Object>(deferredViewMessages);
     deferredViewMessages.clear();
@@ -524,6 +1113,13 @@ public final class Actor {
     for (MulticastMessage.ViewFlush reply : change.replies.values())
       view = Math.max(view, reply.lamportTimestamp);
     return view;
+  }
+
+  private static long nextViewId(ViewChange change) {
+    long maximum = 0;
+    for (MulticastMessage.ViewFlush reply : change.replies.values())
+      maximum = Math.max(maximum, reply.viewId);
+    return maximum + 1;
   }
 
   private void raiseLastSeen(String memberId, long timestamp) {
@@ -738,7 +1334,9 @@ public final class Actor {
 	        }
 	        return;
 	      }
-	      if (state != State.IN_VIEW)
+    if (handleMembershipCrash(crashedId))
+      return;
+	      if (state != State.IN_VIEW && state != State.LEAVING)
 	        return;
 	      ViewChange pendingChange = viewChange;
 	      if (pendingChange != null && pendingChange.subjectId.equals(crashedId) && !group.members().contains(crashedId)) {
@@ -820,6 +1418,8 @@ public final class Actor {
  * When multiple actors crash, they are no longer expected to wait for one another.
  */
   private void tryResolveFlushes() {
+    if (membershipRecovering())
+      return;
     boolean progress;
     do {
       progress = false;
@@ -882,6 +1482,8 @@ public final class Actor {
 
     // 4. Shrink the group and notify the Verifier
     group.remove(crashedId);
+    viewId++;
+    publishView();
     acceptedGeneration.remove(crashedId);
     lastSeen.remove(crashedId);
     verifier.crashed(crashedId);
@@ -893,6 +1495,8 @@ public final class Actor {
     // 5. With the dead actor gone from the view, the stability rule will now pass. Try to deliver!
     tryDeliver();
     redispatchDeferredViewMessages(); // a reinsertion request may have been waiting for this crash flush
+    submitLeaveRequest();
+    finishCrashRecoveryIfReady();
   }
   
   private void link(String peerId, MessageQueue queue) {
@@ -903,9 +1507,9 @@ public final class Actor {
   }
 
   private void sendOne() {
-    if (sent >= messagesToSend)
+    if (sent >= messagesToSend || state != State.IN_VIEW || membershipRequested)
       return;
-    if (frozen) { // a view change is running: try again soon
+    if (frozen || membership != null) { // a view change is running: try again soon
         task.post(new Runnable() {                             
           @Override                                            
           public void run() {                                  
@@ -945,7 +1549,7 @@ public final class Actor {
   private void sendManual(byte[] payload) {
 	  if (state != State.IN_VIEW)
 		  return; // a respawned actor does not multicast before it is reinserted
-	  if (frozen) {                  
+	  if (frozen || membership != null) {
 		    deferredSends.add(payload);  
 		    return;                      
 		  }
@@ -961,6 +1565,12 @@ public final class Actor {
 
    void onReceive(byte[] bytes) {
 	    try {
+	      if (MembershipMessage.isMembershipMessage(bytes)) {
+        receiveMembership(bytes);
+        return;
+      }
+      if (state == State.LEFT)
+        return;
 	      Object incoming = MulticastMessage.decode(bytes);
 	      
 	      if (incoming instanceof MulticastMessage.Ack) {
@@ -981,12 +1591,16 @@ public final class Actor {
 	      // Part 2: Intercept Flush messages
 	      if (incoming instanceof MulticastMessage.Flush) {
 	        MulticastMessage.Flush flush = (MulticastMessage.Flush) incoming;
+        if (deferCrashFlush(flush))
+          return;
 	        observe(flush.senderId, flush.lamportTimestamp);
 	        processFlushSet(flush.senderId, flush.crashedId, flush.pendingMessageIds);
 	        return; 
 	      }
 	      
 	      MulticastMessage message = (MulticastMessage) incoming;
+	      if (message.lamportTimestamp() <= admissionTimestamp)
+            return;
 	      if (!accepts(message.senderId(), message.generationId()))
 	          return;
 	      observe(message.senderId(), message.lamportTimestamp());
@@ -1003,7 +1617,7 @@ public final class Actor {
 	  }
 
   private void acknowledge() {
-	  if (state != State.IN_VIEW)
+	  if (state != State.IN_VIEW && state != State.LEAVING)
 		    return;
     long timestamp = task.logicalClock();
     observe(id, timestamp);
@@ -1019,7 +1633,7 @@ public final class Actor {
   }
 
   private void tryDeliver() {
-	  if (state != State.IN_VIEW || viewChange != null)
+	  if ((state != State.IN_VIEW && state != State.LEAVING) || viewChange != null || membership != null)
 		    return;
     while (!pending.isEmpty()) {
       MulticastMessage head = pending.peek();
@@ -1030,6 +1644,7 @@ public final class Actor {
         continue;
       verifier.delivered(id, head.messageId(), head.payload());
     }
+    submitPendingRequest();
   }
 
   private boolean stable(MulticastMessage message) {

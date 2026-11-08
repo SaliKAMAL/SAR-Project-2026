@@ -16,8 +16,14 @@ import java.util.Set;
 public final class Verifier {
 
   private final Map<String, List<Delivery>> byActor = new LinkedHashMap<String, List<Delivery>>();
+  private final Set<String> leftActors = new HashSet<>();
+  private final Map<String, Set<Long>> joinedAfter = new HashMap<>();
+  private final Map<String, Set<Long>> leftAfter = new HashMap<>();
+  private final Map<String, Set<Long>> missedMembership = new HashMap<>();
 
   public synchronized void delivered(String actorId, long messageId, byte[] payload) {
+    if (leftActors.contains(actorId))
+      throw new AssertionError(actorId + " delivered a message after leaving");
     List<Delivery> deliveries = byActor.get(actorId);
     if (deliveries == null) {
       deliveries = new ArrayList<Delivery>();
@@ -25,6 +31,93 @@ public final class Verifier {
     }
     deliveries.add(new Delivery(messageId, payload.clone()));
     notifyAll();
+  }
+
+  public synchronized void left(String actorId) {
+    if (leftActors.add(actorId))
+      leftAfter.put(actorId, deliveredIds());
+    notifyAll();
+  }
+
+  public synchronized boolean hasLeft(String actorId) {
+    return leftActors.contains(actorId);
+  }
+
+  public synchronized void joined(String actorId) {
+    if (!joinedAfter.containsKey(actorId))
+      joinedAfter.put(actorId, deliveredIds());
+    notifyAll();
+  }
+
+  public synchronized boolean hasJoined(String actorId) {
+    return joinedAfter.containsKey(actorId);
+  }
+
+  /** Keep messages missed during an absence out of later shared-delivery comparisons. */
+  synchronized void resumed(String actorId) {
+    Set<Long> missed = deliveredIds();
+    List<Delivery> own = byActor.get(actorId);
+    if (own != null)
+      for (Delivery delivery : own)
+        missed.remove(delivery.messageId);
+    Set<Long> previous = missedMembership.get(actorId);
+    if (previous == null)
+      missedMembership.put(actorId, missed);
+    else
+      previous.addAll(missed);
+  }
+
+  private Set<Long> deliveredIds() {
+    Set<Long> ids = new HashSet<>();
+    for (List<Delivery> deliveries : byActor.values())
+      for (Delivery delivery : deliveries)
+        ids.add(delivery.messageId);
+    return ids;
+  }
+
+  /** Compare only messages from the time both actors belonged to the group. */
+  public synchronized void checkMembership(List<String> actorIds) {
+    for (int i = 0; i < actorIds.size(); i++) {
+      for (int j = i + 1; j < actorIds.size(); j++) {
+        String first = actorIds.get(i);
+        String second = actorIds.get(j);
+        List<Delivery> a = sharedDeliveries(first, second);
+        List<Delivery> b = sharedDeliveries(second, first);
+        if (a.size() != b.size())
+          throw new AssertionError("different delivery counts for " + first + " and " + second);
+        Set<Long> seen = new HashSet<>();
+        for (int k = 0; k < a.size(); k++) {
+          Delivery expected = a.get(k);
+          Delivery actual = b.get(k);
+          if (!seen.add(expected.messageId) || expected.messageId != actual.messageId
+              || !Arrays.equals(expected.payload, actual.payload))
+            throw new AssertionError("shared delivery " + k + " differs for " + first + " and " + second);
+        }
+      }
+    }
+  }
+
+  private List<Delivery> sharedDeliveries(String actorId, String peerId) {
+    List<Delivery> result = new ArrayList<>();
+    List<Delivery> deliveries = byActor.get(actorId);
+    if (deliveries == null)
+      return result;
+    for (Delivery delivery : deliveries) {
+      long id = delivery.messageId;
+      if (joinedAfter.containsKey(actorId) && joinedAfter.get(actorId).contains(id))
+        throw new AssertionError(actorId + " delivered a message from before joining");
+      if (missedMembership.containsKey(actorId) && missedMembership.get(actorId).contains(id))
+        throw new AssertionError(actorId + " delivered a message missed while absent");
+      if (joinedAfter.containsKey(peerId) && joinedAfter.get(peerId).contains(id))
+        continue;
+      if (missedMembership.containsKey(peerId) && missedMembership.get(peerId).contains(id))
+        continue;
+      if ((leftAfter.containsKey(actorId) && !leftAfter.get(actorId).contains(id))
+          || (leftAfter.containsKey(peerId) && !leftAfter.get(peerId).contains(id)))
+        continue;
+      result.add(delivery);
+    }
+    return result;
   }
 
   private final java.util.Set<String> crashedActors = new java.util.HashSet<String>();

@@ -120,6 +120,8 @@ public final class GroupManager {
     return new Task.Listener() {
       @Override
       public void failed(Task t, Throwable th) {
+        if (actor.state() == Actor.State.LEFT && actor.leaveComplete())
+          return;
         actor.markDead();
         System.out.println(">>> DETECTOR: " + actor.id() + " has crashed! Notifying peers...");
         for (int j = 0; j < all.length; j++) {
