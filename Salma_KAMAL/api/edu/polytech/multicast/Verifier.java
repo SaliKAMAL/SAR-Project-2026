@@ -176,10 +176,32 @@ public final class Verifier {
 
 
   
-  /** The actor is back in the view. */
+  /**
+   * The actor is back in the view. Every id the others have delivered that this actor does not
+   * have was missed while it was absent, including messages delivered after resurrected().
+   */
   public synchronized void reinserted(String actorId) {
     if (!awaitingReinsertion.remove(actorId))
       throw new IllegalStateException(actorId + " was not resurrected");
+    Set<Long> absent = absentIds.get(actorId);
+    if (absent == null) {
+      absent = new HashSet<Long>();
+      absentIds.put(actorId, absent);
+    }
+    Set<Long> own = new HashSet<Long>();
+    List<Delivery> mine = byActor.get(actorId);
+    if (mine != null)
+      for (Delivery delivery : mine)
+        own.add(Long.valueOf(delivery.messageId));
+    for (Map.Entry<String, List<Delivery>> entry : byActor.entrySet()) {
+      if (entry.getKey().equals(actorId))
+        continue;
+      for (Delivery delivery : entry.getValue()) {
+        Long messageId = Long.valueOf(delivery.messageId);
+        if (!own.contains(messageId))
+          absent.add(messageId);
+      }
+    }
     reinsertedActors.add(actorId);
     notifyAll();
   }
